@@ -1,0 +1,52 @@
+{
+  "$id": "file:///manifest.1.2.0.json",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Analyzer manifest",
+  "type": "object",
+  "required": [
+    "analyzer_name",
+    "version",
+    "spec_version",
+    "dependencies",
+    "type",
+    "output",
+    "deterministic"
+  ],
+  "properties": {
+    "analyzer_name": { "type": "string" },
+    "version": { "type": "string" },
+    "spec_version": { "type": "string" },
+    "dependencies": {
+      "type": "object",
+      "patternProperties": { ".*": { "type": "string" } },
+      "additionalProperties": false
+    },
+    "type": { "enum": ["constant", "commit", "git"] },
+    "output": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": { "enum": ["json", "filesystem", "both"] },
+        "finding_extra_schema": {
+          "$ref": "file:///json-schema.draft-07.json"
+        },
+        "error_extra_schema": {
+          "$ref": "file:///json-schema.draft-07.json"
+        }
+      },
+      "additionalProperties": false
+    },
+    "deterministic": { "type": "boolean" },
+    "_original_spec_version": {
+      "description": "If this spec has been migrated, this stores the original version. This field is analyzer-internal.",
+      "type": "string"
+    },
+    "author_name": { "type": "string" },
+    "author_email": { "type": "string" },
+    "extra": {
+      "type": "object",
+      "description": "This field allows for extra information to be stored in the analyzer.json. Use to this store non-required info."
+    }
+  },
+  "additionalProperties": true
+}

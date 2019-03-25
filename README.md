@@ -14,10 +14,14 @@ This is the CLI for interacting with the R2C platform.
 - Install r2c-cli via `pip`:
 
   ```
-  pip install r2c-cli
+  pip3 install r2c-cli
   ```
 
 - Run `r2c` to check that the CLI was installed properly. If installed properly, you should see our help text.
+
+## Documentation
+
+See [getr2c.com](http://getr2c.com) for details on how write analyzer using `r2c-cli`.
 
 ## Usage
 

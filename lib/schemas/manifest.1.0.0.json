@@ -1,0 +1,33 @@
+{
+  "$id": "file:///manifest.1.0.0.json",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Analyzer manifest",
+  "type": "object",
+  "required": [
+    "analyzer_name",
+    "version",
+    "spec_version",
+    "dependencies",
+    "type",
+    "output",
+    "deterministic"
+  ],
+  "properties": {
+    "analyzer_name": { "type": "string" },
+    "version": { "type": "string" },
+    "spec_version": { "type": "string" },
+    "dependencies": {
+      "type": "object",
+      "patternProperties": { ".*": { "type": "string" } },
+      "additionalProperties": false
+    },
+    "type": { "enum": ["constant", "commit", "git"] },
+    "output": { "enum": ["json", "filesystem", "both"] },
+    "deterministic": { "type": "boolean" },
+    "_original_spec_version": {
+      "description": "If this spec has been migrated, this stores the original version. This field is analyzer-internal.",
+      "type": "string"
+    }
+  },
+  "additionalProperties": true
+}
