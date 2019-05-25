@@ -1,23 +1,19 @@
 import json
 import os
-import shutil
 import sys
 from pathlib import Path
 from typing import Optional
 
 import click
 
-from r2c.cli import R2C_SUPPORT_EMAIL, __version__
+from r2c.cli import R2C_SUPPORT_EMAIL
+from r2c.lib.constants import PLATFORM_ANALYZER_PREFIX
 
 DOCKER_FILE = """FROM ubuntu:17.10
 
-ARG UNAME
-ARG UID
-ARG GID
+RUN groupadd -r analysis && useradd -m --no-log-init --gid analysis analysis
 
-RUN groupadd -o $UNAME -g $GID
-RUN useradd -m -u $UID -g $GID -o $UNAME
-USER $UNAME
+USER analysis
 COPY src /analyzer
 
 WORKDIR /
@@ -35,6 +31,11 @@ CODE_DIR="/analysis/inputs/public/source-code"
 
 echo "{\\"results\\": []}" > /analysis/output/output.json"""
 
+README = """# Analyzer name: {}
+# Author name: {}
+# Description: TODO
+"""
+
 
 def create_file(path, content):
     with open(path, "w", newline="\n", encoding="utf-8") as f:
@@ -50,9 +51,12 @@ def create_template_analyzer(
     run_on: str,
     output_type: str,
 ) -> None:
+
+    template_prefix = org or PLATFORM_ANALYZER_PREFIX
+
     analyzer_json_dict = {
         # TODO get from default org
-        "analyzer_name": f"{org or 'example_org'}/{analyzer_name}",
+        "analyzer_name": f"{template_prefix}/{analyzer_name}",
         "author_name": author_name,
         "author_email": author_email,
         "version": "0.0.1",
@@ -72,6 +76,10 @@ def create_template_analyzer(
             fp.write(DOCKER_FILE)
         create_file(os.path.join(analyzer_name, "src", "analyze.sh"), ANALYZE_SH)
         create_file(os.path.join(analyzer_name, "src", "unittest.sh"), UNITTEST_SH)
+
+        readme = README.format(analyzer_name, author_name)
+        create_file(os.path.join(analyzer_name, "README.md"), readme)
+
     except FileExistsError as e:
         click.echo(
             f"❌ {analyzer_name} already exists. Please delete and run again", err=True

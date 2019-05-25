@@ -1,37 +1,18 @@
 #!/usr/bin/env python3
-import logging
-import os
-import sys
-from distutils.util import strtobool
-
-import click
-from r2c.cli import R2C_SUPPORT_EMAIL
-from r2c.cli.core import cli
+from r2c.cli.commands.build import build
+from r2c.cli.commands.cli import cli
+from r2c.cli.commands.init import init
+from r2c.cli.commands.login import login, logout
+from r2c.cli.commands.push import push
+from r2c.cli.commands.run import run
+from r2c.cli.commands.test import test
 from r2c.cli.errors import CliError
-
-logger = logging.getLogger(__name__)
-
-
-def is_debug_mode() -> bool:
-    return strtobool(os.getenv("DEBUG", "False"))
-
+from r2c.cli.logger import print_exception_exit
 
 if __name__ == "__main__":
     try:
         cli(obj={}, prog_name="r2c")
     except CliError as ce:
-        if is_debug_mode():
-            logger.exception(ce)
-        click.echo(
-            f"❌ {ce}. Please use `r2c --debug <CMD>`, to get stack trace. For more help, reach out to R2C at {R2C_SUPPORT_EMAIL}",
-            err=True,
-        )
-        sys.exit(1)
+        print_exception_exit("There was an unexpected client error", ce)
     except Exception as e:
-        if is_debug_mode():
-            logger.exception(e)
-        click.echo(
-            f"❌ Unexpected error. Please run `r2c --debug <CMD>` to get more detailed information. Contact us at {R2C_SUPPORT_EMAIL} for more help.",
-            err=True,
-        )
-        sys.exit(1)
+        print_exception_exit("There was an exception", e)

@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
+## [0.0.18] - 2019-04-17
+
+## Changed
+
+- Client network timeout defaults.
+- When pushed, analyzer contain README.md within the analyzer directory.
+
+## Added
+
+- Developing two dependent analyzers in tandem via overriding "path": "../some/path/to/analyzer" in `analyzer.json`.
+- Added ability to run parameterized analyzer, i.e. pass arguments `--parameters` flag.
+
+## [0.0.17] - 2019-04-17
+
+## Changed
+
+- Unified unittest and integration test functionality under `r2c test`
+
+## Added
+
+- Ability to drop a shell into docker contiainer with `--interactive` option for `r2c run`
+- Caching to enable faster local run times
+
+## [0.0.16] - 2019-04-01
+
+## Changed
+
+- Better handle docker errors
+- Major refactor to make cli code more modular
+- Simplified `r2c init` template to not rely on UID/GID
+
+## Added
+
+- Ability to create github issues on exception
+- Log file for easy of interaction with cli in normal mode and debug info
+- Ability (`-v`) to filter by verbosity
+- Color and emoji for outputs to `stdout`
+
 ## [0.0.15] - 2019-03-21
 
 ## Changed

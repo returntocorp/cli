@@ -1,29 +1,37 @@
-import logging
+import os
+import subprocess
 import webbrowser
-from typing import Any, Dict, Iterator, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import click
+import docker
 import requests
+from docker.errors import APIError
 from requests.models import HTTPError, Response
 
 from r2c.cli.errors import get_cli_error_for_api_error
+from r2c.cli.logger import (
+    get_logger,
+    print_error,
+    print_error_exit,
+    print_exception_exit,
+    print_msg,
+    print_success,
+    print_warning,
+)
 from r2c.cli.util import (
     get_default_org,
     get_default_token,
     get_version,
-    is_local_dev,
-    print_error,
-    print_error_exit,
-    print_msg,
-    print_success,
-    print_warning,
     save_config_creds,
 )
+from r2c.lib.constants import PLATFORM_ANALYZER_PREFIX, PLATFORM_BASE_URL
+from r2c.lib.registry import RegistryData
 
 BAD_AUTH_CODES = {401, 422}
 MAX_RETRIES = 3
-
-logger = logging.getLogger(__name__)
+DEFAULT_TIMEOUT = 10  # sec
+logger = get_logger()
 
 
 def handle_request_with_error_message(r: Response) -> dict:
@@ -54,6 +62,26 @@ def get_auth_header(token: Optional[str]) -> Dict[str, str]:
         return {}
 
 
+def get_registry_data() -> RegistryData:
+    try:
+        registry_data = RegistryData.from_json(fetch_registry_data())
+    except Exception as e:
+        print_exception_exit("There was an error fetching data from the registry", e)
+    return registry_data
+
+
+def fetch_registry_data():
+    org = get_default_org()
+    url = f"{get_base_url()}/api/v1/analyzers/"
+    r = auth_get(url)
+
+    response_json = handle_request_with_error_message(r)
+    if response_json["status"] == "success":
+        return response_json["analyzers"]
+    else:
+        raise ValueError("Couldn't parse analyzer registry response")
+
+
 def open_browser_login(org: Optional[str]) -> None:
     url = get_authentication_url(org)
     print_msg(f"trying to open {url} in your browser...")
@@ -65,6 +93,43 @@ def open_browser_login(org: Optional[str]) -> None:
         )
 
 
+def check_docker_is_running():
+    try:
+        client = docker.from_env()
+        client.info()
+    except APIError as e:
+        # when docker server fails
+        print_error_exit(
+            "`docker info` failed. Please confirm docker daemon is running in user mode."
+        )
+    except Exception as e:
+        # Other stuff this might throw like, permission error
+        print_error_exit(
+            "`docker info` failed. Please confirm docker is installed and its daemon is running in user mode."
+        )
+
+
+def docker_login(creds, debug=False):
+    check_docker_is_running()
+    docker_login_cmd = [
+        "docker",
+        "login",
+        "-u",
+        creds.get("login"),
+        "-p",
+        creds.get("password"),
+        creds.get("endpoint"),
+    ]
+    with open(os.devnull, "w") as FNULL:
+        if debug:
+            return_code = subprocess.call(
+                docker_login_cmd, stdout=FNULL, stderr=subprocess.STDOUT
+            )
+        else:
+            return_code = subprocess.call(docker_login_cmd, stdout=FNULL, stderr=FNULL)
+    return return_code == 0
+
+
 def do_login(
     org: Optional[str] = None, login_token: Optional[str] = None
 ) -> Optional[str]:
@@ -72,7 +137,10 @@ def do_login(
     if org is None:
         org = get_default_org()
         if org is None:
-            org = click.prompt("Please enter your group name")
+            org = click.prompt(
+                "Please enter your org name, or to use the common r2c platform, press enter",
+                default=PLATFORM_ANALYZER_PREFIX,
+            )
     if not login_token:
         if click.confirm(
             "Opening web browser to get login token. Do you want to continue?",
@@ -113,8 +181,7 @@ def login_retry(fn):
 
 
 def get_docker_creds(artifact_link):
-    if is_local_dev():
-        return {}
+    logger.info(f"changed_artifact link to {artifact_link}")
     r = auth_get(artifact_link)
     if r.status_code == requests.codes.ok:
         data = r.json()
@@ -123,17 +190,15 @@ def get_docker_creds(artifact_link):
         return None
 
 
-def get_base_url(
-    org: Optional[str] = get_default_org(), local_dev: bool = is_local_dev()
-) -> str:
-    """Return the base url for an org or the public instance. Return a localhost url if local_dev is True"""
-    if local_dev:
-        return "http://localhost:5000"
-    elif org:
+def get_base_url(org: Optional[str] = get_default_org()) -> str:
+    """Return the base url for an org or the public instance."""
+    if org and org != PLATFORM_ANALYZER_PREFIX:
         return f"https://{org}.massive.ret2.co"
     else:
-        logger.info("No org set so going to use 'public' org")
-        return f"https://public.massive.ret2.co"
+        logger.info(
+            f"Using {PLATFORM_ANALYZER_PREFIX} org with base {PLATFORM_BASE_URL}"
+        )
+        return PLATFORM_BASE_URL
 
 
 def get_authentication_url(org: Optional[str]) -> str:
@@ -147,6 +212,7 @@ def auth_get(
     params: Dict[str, str] = {},
     headers: Dict[str, str] = {},
     token: Optional[str] = None,
+    timeout: Optional[float] = DEFAULT_TIMEOUT,
 ) -> requests.models.Response:
     """Perform a requests.get with Authorization and default headers set"""
     headers = {
@@ -154,7 +220,7 @@ def auth_get(
         **headers,
         **get_auth_header(token or get_default_token()),
     }
-    r = requests.get(url, headers=headers, params=params)
+    r = requests.get(url, headers=headers, params=params, timeout=timeout)
     return r
 
 
@@ -172,7 +238,9 @@ def auth_post(
         **headers,
         **get_auth_header(token or get_default_token()),
     }
-    r = requests.post(url, headers=headers, params=params, json=json)
+    r = requests.post(
+        url, headers=headers, params=params, json=json, timeout=DEFAULT_TIMEOUT
+    )
     return r
 
 
@@ -190,7 +258,9 @@ def auth_put(
         **headers,
         **get_auth_header(token or get_default_token()),
     }
-    r = requests.put(url, headers=headers, params=params, json=json)
+    r = requests.put(
+        url, headers=headers, params=params, json=json, timeout=DEFAULT_TIMEOUT
+    )
     return r
 
 
@@ -215,7 +285,9 @@ def auth_delete(
 def validate_token(org: str, token: str) -> bool:
     try:
         headers = {**get_default_headers(), **get_auth_header(token)}
-        r = requests.get(f"{get_base_url(org)}/api/users", headers=headers)
+        r = requests.get(
+            f"{get_base_url(org)}/api/users", headers=headers, timeout=DEFAULT_TIMEOUT
+        )
         return r.status_code == requests.codes.ok
     except Exception as e:
         # TODO log exception
@@ -227,7 +299,10 @@ def check_valid_token_with_logging(org: str, token: str) -> Optional[str]:
     if valid_token:
         # save to ~/.r2c
         save_config_creds(org, token)
-        print_success(f"You are now logged in to: {org} 🎉")
+        if org == PLATFORM_ANALYZER_PREFIX:
+            print_success(f"You are now logged in to the r2c platform 🎉")
+        else:
+            print_success(f"You are now logged in to: {org} 🎉")
         return token
     else:
         print_error(

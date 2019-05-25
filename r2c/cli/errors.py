@@ -7,7 +7,9 @@ from r2c.lib.errors import ApiErrorType
 class ManifestNotFoundError(Exception):
     """Couldn't find analyzer manifest on the local filesystem, even after traversal"""
 
-    pass
+
+class ReadmeNotFoundError(Exception):
+    """Couldn't find analyzer readme on the local filesystem, even after traversal"""
 
 
 class CliError(Exception, metaclass=abc.ABCMeta):
@@ -102,6 +104,8 @@ API_ERROR_TYPE_TO_CLI_ERROR: Dict[str, Callable] = {
     ApiErrorType.WRONG_ORG_SUBMITTED.name: ReadLocalOrgCliError,
     # ecr/boto related
     ApiErrorType.ECR_ERROR.name: UnexpectedCliError,
+    # locally linked analyzer push
+    ApiErrorType.LINKED_ANALYZER_ERROR.name: UploadAnalyzerCliError,
 }
 
 

@@ -21,7 +21,7 @@ This is the CLI for interacting with the R2C platform.
 
 ## Documentation
 
-See [getr2c.com](http://getr2c.com) for details on how write analyzer using `r2c-cli`.
+See [docs.r2c.dev](https://docs.r2c.dev) for details on how write analyzer using `r2c-cli`.
 
 ## Usage
 
@@ -66,4 +66,4 @@ to upload your analyzer to your repository.
 
 ## Troubleshooting
 
-- If you run into issues running `r2c` commands, you can run with `--debug` flag and reach out to `support@ret2.co` with the error log.
+- If you run into issues running `r2c` commands, you can run with `--verbose` flag and reach out to `support@ret2.co` with the error log.

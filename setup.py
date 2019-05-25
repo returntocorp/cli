@@ -1,6 +1,7 @@
 import codecs
 import os
 import re
+import subprocess
 
 import setuptools
 
@@ -25,9 +26,11 @@ def find_version(*file_paths):
 with open("README.md", "r") as fh:
     long_description = fh.read()
 
+requirements_txt = subprocess.run(
+    ["pipenv", "lock", "-r"], check=True, encoding="utf-8", stdout=subprocess.PIPE
+)
+install_requires = requirements_txt.stdout.splitlines()
 
-with open("requirements.txt", "r") as fh:
-    install_requires = fh.read().splitlines()
 # I apologize in advance, but this issue https://github.com/pypa/pipenv/issues/3305
 # makes me very very sad
 print("raw requirements", install_requires)
@@ -39,7 +42,7 @@ cleaned_requirements = [
 print("cleaned requirements", cleaned_requirements)
 
 
-all_deps = ["r2c-lib==0.0.10"] + cleaned_requirements
+all_deps = ["r2c-lib==0.0.14a1"] + cleaned_requirements
 
 setuptools.setup(
     name="r2c-cli",
@@ -51,7 +54,8 @@ setuptools.setup(
     long_description_content_type="text/markdown",
     url="https://ret2.co",
     install_requires=all_deps,
-    packages=["r2c", "r2c.cli"],
+    packages=["r2c", "r2c.cli", "r2c.cli.commands"],
+    python_requires=">=3.6",
     include_package_data=True,
     license="Proprietary",
     classifiers=[

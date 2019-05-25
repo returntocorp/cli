@@ -1,29 +1,53 @@
+import itertools
 import json
-import logging
 import os
-import sys
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional, Tuple
 
-import click
-
-from r2c.cli import __version__
+from r2c.cli.errors import ManifestNotFoundError, ReadmeNotFoundError
+from r2c.cli.logger import (
+    get_logger,
+    log_manifest_not_found,
+    print_error,
+    print_error_exit,
+    set_debug_log_level,
+    set_verbose_log_level,
+)
+from r2c.lib.manifest import AnalyzerManifest, MalformedManifestException
 
 LOCAL_CONFIG_DIR = os.path.join(Path.home(), ".r2c")
 CONFIG_FILENAME = "config.json"
 CREDS_FILENAME = "credentials.json"
 DEFAULT_ORG_KEY = "defaultOrg"
+DEFAULT_MANIFEST_TRAVERSAL_LIMIT = 50  # number of dirs to climb before giving up
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 
-def is_local_dev() -> bool:
-    return os.getenv("LOCAL_DEV") == "True"
+def set_debug_flag(ctx: Any, debug: bool) -> None:
+    if debug:
+        set_debug_log_level()
+    ctx.obj["DEBUG"] = debug
+
+
+def set_verbose_flag(ctx: Any, verbose: bool) -> None:
+    if verbose:
+        set_verbose_log_level()
+    ctx.obj["VERBOSE"] = verbose
 
 
 def get_version():
     """Get the current r2c-cli version based on __init__"""
+    from r2c.cli import __version__
+
     return __version__
+
+
+def parse_remaining(pairs: str) -> Dict:
+    """
+    Given a string of remaining arguments (after the "--"), that looks like "['x=y', 'a=b'] return a dict of { 'x': 'y' }
+    """
+    return {pair.split("=")[0]: pair.split("=")[1] for pair in pairs}
 
 
 def load_creds() -> Dict[str, str]:
@@ -33,8 +57,19 @@ def load_creds() -> Dict[str, str]:
         with open(cred_file) as fp:
             return json.load(fp)
     except Exception as e:
-        logger.info(f"unable to read token file from {cred_file}: {e}")
+        logger.debug(f"unable to read token file from {cred_file}: {e}")
         return {}
+
+
+def load_params(params: str) -> Dict:
+    try:
+        parameter_obj = json.loads(params)
+    except ValueError as e:
+        print_error(
+            f'Failed to parse parameter string:"{params}" as json. Parse Error: {e}'
+        )
+        parameter_obj = {}
+    return parameter_obj
 
 
 def save_creds(creds: Dict[str, str]) -> bool:
@@ -45,7 +80,7 @@ def save_creds(creds: Dict[str, str]) -> bool:
         save_json(creds, cred_file)
         return True
     except Exception as e:
-        logger.info(f"unable to save cred file to {cred_file}: {e}")
+        logger.debug(f"unable to save cred file to {cred_file}: {e}")
         return False
 
 
@@ -56,7 +91,7 @@ def load_config() -> Dict[str, str]:
         with open(config_file) as fp:
             return json.load(fp)
     except Exception as e:
-        logger.info(f"unable to read config from {config_file}: {e}")
+        logger.debug(f"unable to read config from {config_file}: {e}")
         return {}
 
 
@@ -74,7 +109,7 @@ def save_config(config: Dict[str, str]) -> bool:
         save_json(config, config_file)
         return True
     except Exception as e:
-        logger.info(f"unable to save config file to {config_file}: {e}")
+        logger.debug(f"unable to save config file to {config_file}: {e}")
         return False
 
 
@@ -129,28 +164,116 @@ def save_json(obj: Any, filepath: str) -> None:
         json.dump(obj, fp, indent=4, sort_keys=True)
 
 
-def print_msg(message: str, err: bool = True) -> None:
-    click.echo(message, err=err)
+def climb_dir_tree(start_path: str) -> Iterator[str]:
+    next_path = start_path
+    current_path = None
+    while next_path != current_path:
+        current_path = next_path
+        next_path = os.path.dirname(current_path)
+        yield current_path
 
 
-def print_success(message: str, err: bool = True) -> None:
-    click.echo(click.style(f"✅ {message}", fg="green"), err=err)
+def _find_analyzer_manifest_path(path: str, parent_limit: int) -> Tuple[str, str]:
+    """Finds an analyzer manifest file starting at PATH and ascending up the dir tree.
+
+    Arguments:
+        path: where to start looking for analyzer.json
+        parent_limit: limit on the number of directories to ascend
+
+    Returns:
+        (path to analyzer.json, path containing analyzer.json for Docker build)
+    """
+
+    for path in itertools.islice(climb_dir_tree(path), parent_limit):
+        manifest_path = os.path.join(path, "analyzer.json")
+        if os.path.exists(manifest_path):
+            return manifest_path, os.path.dirname(manifest_path)
+
+    raise ManifestNotFoundError()
 
 
-def print_warning(message: str, err: bool = True) -> None:
-    click.echo(click.style(f"⚠️  {message}", fg="yellow"), err=err)
+def _find_analyzer_readme_path(path: str, parent_limit: int) -> str:
+    """Finds an analyzer readme file starting at PATH and ascending up the dir tree.
+
+    Arguments:
+        path: where to start looking for README.md
+        parent_limit: limit on the number of directories to ascend
+
+    Returns:
+        path to README.md
+    """
+
+    for path in itertools.islice(climb_dir_tree(path), parent_limit):
+        readme_path = os.path.join(path, "README.md")
+        if os.path.exists(readme_path):
+            return readme_path
+
+    raise ReadmeNotFoundError()
 
 
-def print_error(message: str, err: bool = True) -> None:
-    click.echo(click.style(f"❌ {message}", fg="red"), err=err)
+def get_manifest_traversal_limit(ctx):
+    return 1 if ctx.obj["NO_TRAVERSE_MANIFEST"] else DEFAULT_MANIFEST_TRAVERSAL_LIMIT
 
 
-def print_error_exit(message: str, status_code: int = 1, err: bool = True) -> None:
-    click.echo(click.style(f"❌ {message}", fg="red"), err=err)
-    sys.exit(status_code)
+def find_and_open_analyzer_manifest(
+    path: str, ctx: Any = None
+) -> Tuple[AnalyzerManifest, str]:
+    """Returns the parsed AnalyzerManifest object and the parent dir of the manifest for the manifest discovered by starting at `path` and ascending up
+
+    """
+    try:
+        manifest_path, manifest_parent_dir = _find_analyzer_manifest_path(
+            path,
+            parent_limit=get_manifest_traversal_limit(ctx)
+            if ctx
+            else DEFAULT_MANIFEST_TRAVERSAL_LIMIT,
+        )
+    except ManifestNotFoundError as e:
+        log_manifest_not_found()
+        raise e
+
+    logger.debug(f"Found analyzer.json at {manifest_path}")
+
+    with open(manifest_path, encoding="utf-8") as f:
+        try:
+            raw_manifest = f.read()
+            logger.debug(f"Contents of analyzer.json:\n{raw_manifest}")
+            return (AnalyzerManifest.from_json_str(raw_manifest), manifest_parent_dir)
+        except MalformedManifestException as e:
+            print_error_exit(
+                f"The analyzer.json at {manifest_path} does not conform to the schema: {e}"
+            )
+            raise e
 
 
-def log_manifest_not_found_then_die():
-    print_error_exit(
-        "Couldn't find an analyzer.json for this analyzer. Check that you're currently in an analyzer directory, or make sure the --analyzer-directory path contains an analyzer.json"
-    )
+def find_and_open_analyzer_readme(path: str, ctx: Any = None) -> Optional[str]:
+    """Returns the readme discovered by starting at `path` and ascending up
+
+    """
+    try:
+        readme_path = _find_analyzer_readme_path(
+            path,
+            parent_limit=get_manifest_traversal_limit(ctx)
+            if ctx
+            else DEFAULT_MANIFEST_TRAVERSAL_LIMIT,
+        )
+    except ReadmeNotFoundError as e:
+        logger.debug("Readme not found")
+        return None
+
+    logger.debug(f"Found readme at {readme_path}")
+
+    with open(readme_path, encoding="utf-8") as f:
+        raw_readme = f.read()
+        logger.debug(f"Contents of README.md:\n{raw_readme}")
+        return raw_readme
+
+
+def get_org_from_analyzer_name(analyzer_name: str) -> str:
+    """Given a '/' separated name of analyzer, e.g. r2c/typeflow, returns the org name which is 'r2c'
+    """
+    names = analyzer_name.split("/")
+    assert (
+        len(names) == 2
+    ), f"Make sure you specified org and analyzer_name as `org/analyzer_name` in your analyzer.json"
+    return names[0]
