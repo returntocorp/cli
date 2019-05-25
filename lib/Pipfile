@@ -1,0 +1,28 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+docker = "~=3.7"
+toposort = "~=1.5"
+setuptools = "~=40.8"
+jsondiff = "~=1.1"
+gitpython = "~=2.1"
+requests = "~=2.0"
+jsonschema = "~=3.0"
+semantic-version = "~=2.6"
+importlib_resources = "~=1.0"
+mypy-extensions = "~=0.4"
+
+[dev-packages]
+black = "==18.9b0"
+pytest = "~=3.9"
+lxml = "~=4.2"
+mypy = "~=0.670"
+
+[requires]
+python_version = "3.7"
+
+[pipenv]
+allow_prereleases = true

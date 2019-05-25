@@ -6,7 +6,6 @@ from r2c.lib.analyzer import Analyzer, InvalidAnalyzerOutput
 from r2c.lib.manifest import AnalyzerOutputType
 from r2c.lib.specified_analyzer import SpecifiedAnalyzer
 from r2c.lib.versioned_analyzer import AnalyzerName, VersionedAnalyzer
-from r2c.lib.constants import S3_ANALYSIS_BUCKET_NAME
 
 import pytest
 from semantic_version import Version
@@ -16,10 +15,14 @@ def test_nonjson_validator():
     """
         Checks that non json analyzers are not validated
     """
-    infra = MagicMock()
+    json_output_store = MagicMock()
+    filesystem_output_store = MagicMock()
+    log_store = MagicMock()
     registry_data = MagicMock()
 
-    analyzer = Analyzer(infra, registry_data)
+    analyzer = Analyzer(
+        registry_data, json_output_store, filesystem_output_store, log_store
+    )
 
     # Filesystem Output validates
     manifest = MagicMock(output_type=AnalyzerOutputType.filesystem)
@@ -30,10 +33,14 @@ def test_invalidjson_validator():
     """
         Checks that invalid json does not validate
     """
-    infra = MagicMock()
+    json_output_store = MagicMock()
+    filesystem_output_store = MagicMock()
+    log_store = MagicMock()
     registry_data = MagicMock()
 
-    analyzer = Analyzer(infra, registry_data)
+    analyzer = Analyzer(
+        registry_data, json_output_store, filesystem_output_store, log_store
+    )
 
     manifest = MagicMock(output_type=AnalyzerOutputType.json)
 
@@ -54,28 +61,32 @@ def test_upload_on_failure():
     def raise_invalid_output(a, b):
         raise InvalidAnalyzerOutput(json.JSONDecodeError)
 
-    infra = MagicMock()
     registry_data = MagicMock()
 
     manifest = MagicMock(output_type=AnalyzerOutputType.json)
-    with patch.object(Analyzer, "_get_manifest", return_value=manifest):
-        analyzer = Analyzer(infra, registry_data)
-        analyzer._validate_output = MagicMock(side_effect=raise_invalid_output)
-        analyzer.analysis_key = MagicMock(return_value="key")
+    registry_data.manifest_for = MagicMock(return_value=manifest)
 
-        with pytest.raises(InvalidAnalyzerOutput):
-            analyzer.upload_output(
-                SpecifiedAnalyzer(
-                    VersionedAnalyzer(
-                        AnalyzerName("massive-r2c/test"), Version("1.0.0")
-                    )
-                ),
-                "git_url",
-                "commit_hash",
-                "folder",
-            )
+    json_output_store = MagicMock()
+    filesystem_output_store = MagicMock()
+    log_store = MagicMock()
 
-    infra.put_file.assert_called_once()
+    analyzer = Analyzer(
+        registry_data, json_output_store, filesystem_output_store, log_store
+    )
+    analyzer._validate_output = MagicMock(side_effect=raise_invalid_output)
+    analyzer.analysis_key = MagicMock(return_value="key")
+
+    with pytest.raises(InvalidAnalyzerOutput):
+        analyzer.upload_output(
+            SpecifiedAnalyzer(
+                VersionedAnalyzer(AnalyzerName("massive-r2c/test"), Version("1.0.0"))
+            ),
+            "git_url",
+            "commit_hash",
+            "folder",
+        )
+
+    json_output_store.put.assert_called_once()
 
 
 MOUNT_FOLDER = "mount_folder"
@@ -85,53 +96,60 @@ FILESYSTEM_KEY = f"{ROOT_KEY}.tar.gz"
 
 
 def test_upload_json():
-    infra = MagicMock()
     registry_data = MagicMock()
 
     manifest = MagicMock(output_type=AnalyzerOutputType.json)
-    with patch.object(Analyzer, "_get_manifest", return_value=manifest):
-        analyzer = Analyzer(infra, registry_data)
-        analyzer.analysis_key = MagicMock(return_value=JSON_KEY)
-        analyzer._validate_output = MagicMock()
-        analyzer.upload_output(
-            SpecifiedAnalyzer(
-                VersionedAnalyzer(AnalyzerName("massive-r2c/test"), Version("1.0.0"))
-            ),
-            "git_url",
-            "commit_hash",
-            MOUNT_FOLDER,
-        )
+    registry_data.manifest_for = MagicMock(return_value=manifest)
+    json_output_store = MagicMock()
+    filesystem_output_store = MagicMock()
+    log_store = MagicMock()
 
-    infra.put_file.assert_called_once_with(
-        S3_ANALYSIS_BUCKET_NAME, f"{MOUNT_FOLDER}/output/output.json", JSON_KEY
+    analyzer = Analyzer(
+        registry_data, json_output_store, filesystem_output_store, log_store
+    )
+    analyzer.analysis_key = MagicMock(return_value=JSON_KEY)
+    analyzer._validate_output = MagicMock()
+
+    specified_analyzer = SpecifiedAnalyzer(
+        VersionedAnalyzer(AnalyzerName("massive-r2c/test"), Version("1.0.0"))
+    )
+    analyzer.upload_output(specified_analyzer, "git_url", "commit_hash", MOUNT_FOLDER)
+
+    json_output_store.put.assert_called_once_with(
+        "git_url",
+        "commit_hash",
+        specified_analyzer,
+        f"{MOUNT_FOLDER}/output/output.json",
     )
 
 
 def test_upload_filesystem():
-    infra = MagicMock()
     registry_data = MagicMock()
 
     manifest = MagicMock(output_type=AnalyzerOutputType.filesystem)
-    with patch.object(Analyzer, "_get_manifest", return_value=manifest):
-        with patch.object(tarfile.TarFile, "add") and patch.object(tarfile, "open"):
-            analyzer = Analyzer(infra, registry_data)
-            analyzer.analysis_key = MagicMock(return_value=FILESYSTEM_KEY)
-            analyzer._validate_output = MagicMock()
-            analyzer.upload_output(
-                SpecifiedAnalyzer(
-                    VersionedAnalyzer(
-                        AnalyzerName("massive-r2c/test"), Version("1.0.0")
-                    )
-                ),
-                "git_url",
-                "commit_hash",
-                MOUNT_FOLDER,
-            )
+    registry_data.manifest_for = MagicMock(return_value=manifest)
 
-            tarfile.open.assert_called_once()
+    json_output_store = MagicMock()
+    filesystem_output_store = MagicMock()
+    log_store = MagicMock()
 
-    infra.put_file.assert_called_once_with(
-        S3_ANALYSIS_BUCKET_NAME, f"{MOUNT_FOLDER}/output/fs.tar.gz", FILESYSTEM_KEY
+    with patch.object(tarfile.TarFile, "add") and patch.object(tarfile, "open"):
+        analyzer = Analyzer(
+            registry_data, json_output_store, filesystem_output_store, log_store
+        )
+        analyzer.analysis_key = MagicMock(return_value=FILESYSTEM_KEY)
+        analyzer._validate_output = MagicMock()
+        specified_analyzer = SpecifiedAnalyzer(
+            VersionedAnalyzer(AnalyzerName("massive-r2c/test"), Version("1.0.0"))
+        )
+        analyzer.upload_output(
+            specified_analyzer, "git_url", "commit_hash", MOUNT_FOLDER
+        )
+
+        tarfile.open.assert_called_once()
+
+    filesystem_output_store.put.assert_called_once_with(
+        "git_url", "commit_hash", specified_analyzer, f"{MOUNT_FOLDER}/output/fs.tar.gz"
     )
 
 
@@ -144,31 +162,35 @@ def test_upload_both():
         else:
             raise Exception
 
-    infra = MagicMock()
     registry_data = MagicMock()
+    json_output_store = MagicMock()
+    filesystem_output_store = MagicMock()
+    log_store = MagicMock()
 
     manifest = MagicMock(output_type=AnalyzerOutputType.both)
-    with patch.object(Analyzer, "_get_manifest", return_value=manifest):
-        with patch.object(tarfile.TarFile, "add") and patch.object(tarfile, "open"):
-            analyzer = Analyzer(infra, registry_data)
-            analyzer.analysis_key = MagicMock(side_effect=analysis_key_mock)
-            analyzer._validate_output = MagicMock()
-            analyzer.upload_output(
-                SpecifiedAnalyzer(
-                    VersionedAnalyzer(
-                        AnalyzerName("massive-r2c/test"), Version("1.0.0")
-                    )
-                ),
-                "git_url",
-                "commit_hash",
-                MOUNT_FOLDER,
-            )
+    registry_data.manifest_for = MagicMock(return_value=manifest)
 
-            tarfile.open.assert_called_once()
+    with patch.object(tarfile.TarFile, "add") and patch.object(tarfile, "open"):
+        analyzer = Analyzer(
+            registry_data, json_output_store, filesystem_output_store, log_store
+        )
+        analyzer.analysis_key = MagicMock(side_effect=analysis_key_mock)
+        analyzer._validate_output = MagicMock()
+        specified_analyzer = SpecifiedAnalyzer(
+            VersionedAnalyzer(AnalyzerName("massive-r2c/test"), Version("1.0.0"))
+        )
+        analyzer.upload_output(
+            specified_analyzer, "git_url", "commit_hash", MOUNT_FOLDER
+        )
 
-    infra.put_file.assert_any_call(
-        S3_ANALYSIS_BUCKET_NAME, f"{MOUNT_FOLDER}/output/output.json", JSON_KEY
+        tarfile.open.assert_called_once()
+
+    json_output_store.put.assert_called_once_with(
+        "git_url",
+        "commit_hash",
+        specified_analyzer,
+        f"{MOUNT_FOLDER}/output/output.json",
     )
-    infra.put_file.assert_any_call(
-        S3_ANALYSIS_BUCKET_NAME, f"{MOUNT_FOLDER}/output/fs.tar.gz", FILESYSTEM_KEY
+    filesystem_output_store.put.assert_called_once_with(
+        "git_url", "commit_hash", specified_analyzer, f"{MOUNT_FOLDER}/output/fs.tar.gz"
     )

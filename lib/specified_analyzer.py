@@ -1,14 +1,13 @@
 import json
-from typing import Any, Dict, NewType, Optional
+from typing import Dict, NewType, Optional
+
+from mypy_extensions import TypedDict
 
 from r2c.lib.versioned_analyzer import (
     AnalyzerName,
     VersionedAnalyzer,
     VersionedAnalyzerJson,
 )
-
-from mypy_extensions import TypedDict
-from semantic_version import Version
 
 AnalyzerParameters = NewType("AnalyzerParameters", Dict[str, str])
 
@@ -79,7 +78,10 @@ class SpecifiedAnalyzer:
         return False
 
     def __repr__(self):
-        return str(self.versioned_analyzer) + " parameters:" + str(self._parameters)
+        repr_str = str(self.versioned_analyzer)
+        if self._parameters:
+            repr_str += " parameters:" + str(self._parameters)
+        return repr_str
 
     # this is just because of a quirk of the toposort lib we're using, namely
     # that it attemps to sort values before printing an exception string

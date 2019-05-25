@@ -3,8 +3,8 @@ import os
 PREFIX: str = os.getenv("PIPELINE_PREFIX", default="test_prefix")
 # analyzer related
 S3_CODE_BUCKET_NAME: str = f"r2c-{PREFIX}-pipeline-code"
-S3_ANALYSIS_BUCKET_NAME: str = f"r2c-{PREFIX}-pipeline-analysis"
-S3_ANALYSIS_LOG_BUCKET_NAME: str = f"r2c-{PREFIX}-pipeline-analysis-log"
+S3_ANALYSIS_BUCKET_NAME: str = "r2c-pipeline-analysis-output"
+S3_ANALYSIS_LOG_BUCKET_NAME: str = "r2c-pipeline-analysis-log"
 
 # registry related
 # TODO remove this on API supports manifest
@@ -24,4 +24,10 @@ ECR_URL: str = f"{AWS_ACCOUNT}.dkr.ecr.us-west-2.amazonaws.com"
 
 SRC_CODE_ANALYZER_NAME = "public/source-code"
 GIT_REPO_ANALYZER_NAME = "public/git-repo"
-SPECIAL_ANALYZERS = set([SRC_CODE_ANALYZER_NAME, GIT_REPO_ANALYZER_NAME])
+PYTHON_URL_ANALYZER_NAME = "public/pypi"
+SPECIAL_ANALYZERS = set(
+    [SRC_CODE_ANALYZER_NAME, GIT_REPO_ANALYZER_NAME, PYTHON_URL_ANALYZER_NAME]
+)
+
+PLATFORM_ANALYZER_PREFIX = "beta"
+PLATFORM_BASE_URL = "https://app.r2c.dev"

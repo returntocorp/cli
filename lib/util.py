@@ -1,5 +1,4 @@
 import base64
-import json
 import logging
 import os
 import signal
@@ -11,9 +10,8 @@ from collections import OrderedDict
 from functools import cmp_to_key
 from operator import itemgetter as i
 from pathlib import Path
-from typing import NewType, Optional
 
-import requests
+from semantic_version import Version
 
 logger = logging.getLogger(__name__)
 
@@ -122,15 +120,6 @@ def run_streaming(cmd):
         raise subprocess.CalledProcessError(rc, cmd)
 
 
-class SymlinkNeedsElevationError(Exception):
-    """
-    Thrown when a symlink exists in a directory, which requires different behavior
-    to handle when copying the contents of the directory
-    """
-
-    pass
-
-
 def symlink_exists(dir: str) -> bool:
     for (cur_path, dirnames, filenames) in os.walk(dir):
         dirpaths = [os.path.join(cur_path, dirname) for dirname in dirnames]
@@ -150,24 +139,15 @@ def handle_readonly_fix(func, path, execinfo):
     func(path)
 
 
-def recursive_chmod_777(dir: str) -> None:
-    if os.name != "nt":
-        subprocess.call(["chmod", "-R", "777", dir])
-    else:
-        os.chmod(dir, 0o777)
-        for (cur_path, dirnames, filenames) in os.walk(dir):
-            dirpaths = [os.path.join(cur_path, dirname) for dirname in dirnames]
-            filepaths = [os.path.join(cur_path, filename) for filename in filenames]
-            children = dirpaths + filepaths
-
-            for child in children:
-                if not os.path.islink(child):
-                    os.chmod(child, 0o777)
-
-
 def get_tmp_dir():
     """Wrapper around tempfile to handle MacOS specific issues. See #2733"""
     # for MacOS lets use /tmp, not /var
     if os.name == "posix" and sys.platform == "darwin":
         return "/tmp"
     return tempfile.gettempdir()
+
+
+def get_unique_semver(version: Version) -> Version:
+    """ Give a unique semver version of the given version """
+    # TODO find a better way to do this
+    return Version(f"9.9.9-alpha999")

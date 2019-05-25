@@ -7,7 +7,6 @@ methods that this exposes.
 import copy
 import json
 import logging
-import sys
 import urllib.parse
 from typing import Optional
 
@@ -20,12 +19,14 @@ from semantic_version import Version
 
 logger = logging.getLogger(__name__)
 
-SPEC_VERSION = Version("1.2.0")
+SPEC_VERSION = Version("2.1.0")
 
 _MANIFEST_SCHEMAS = {
     Version("1.0.0"): json.load(open_text(__name__, "manifest.1.0.0.json")),
     Version("1.1.0"): json.load(open_text(__name__, "manifest.1.1.0.json")),
     Version("1.2.0"): json.load(open_text(__name__, "manifest.1.2.0.json")),
+    Version("2.0.0"): json.load(open_text(__name__, "manifest.2.0.0.json")),
+    Version("2.1.0"): json.load(open_text(__name__, "manifest.2.1.0.json")),
 }
 
 # 1.0.0 and 1.1.0 both have the same output schema.
@@ -37,6 +38,8 @@ _ANALYZER_OUTPUT_SCHEMAS = {
     Version("1.0.0"): json.load(open_text(__name__, "analyzer_output.1.0.0.json")),
     Version("1.1.0"): json.load(open_text(__name__, "analyzer_output.1.0.0.json")),
     Version("1.2.0"): json.load(open_text(__name__, "analyzer_output.1.0.0.json")),
+    Version("2.0.0"): json.load(open_text(__name__, "analyzer_output.1.0.0.json")),
+    Version("2.1.0"): json.load(open_text(__name__, "analyzer_output.1.0.0.json")),
 }
 
 # The integration test schemas refer to the analyzer schema, so they maintain the same versioning (integeration test schema X is always 1-to-1 with output schema X)
@@ -44,6 +47,8 @@ _ANALYZER_INTEGRATION_TEST_SCHEMAS = {
     Version("1.0.0"): json.load(open_text(__name__, "integration_test.1.0.0.json")),
     Version("1.1.0"): json.load(open_text(__name__, "integration_test.1.0.0.json")),
     Version("1.2.0"): json.load(open_text(__name__, "integration_test.1.0.0.json")),
+    Version("2.0.0"): json.load(open_text(__name__, "integration_test.2.0.0.json")),
+    Version("2.1.0"): json.load(open_text(__name__, "integration_test.2.0.0.json")),
 }
 
 

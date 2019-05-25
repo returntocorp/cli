@@ -21,3 +21,12 @@ class ApiErrorType(Enum):
 
     # ecr/boto related
     ECR_ERROR = 11
+    # linked analyzer push
+    LINKED_ANALYZER_ERROR = 12
+
+
+class SymlinkNeedsElevationError(Exception):
+    """
+    Thrown when a symlink exists in a directory, which requires different behavior
+    to handle when copying the contents of the directory
+    """

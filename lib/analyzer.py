@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import abc
 import json
 import logging
 import os
@@ -7,41 +8,38 @@ import shutil
 import subprocess
 import sys
 import tarfile
-import tempfile
 import threading
-import traceback
 from datetime import datetime
-from typing import NewType, Optional, Tuple, Union
+from typing import Dict, NewType, Optional, Tuple, Union
 
 import docker
-import git
 import jsonschema
 
-from r2c.lib import schemas
 from r2c.lib.constants import (
     DEFAULT_ANALYSIS_WORKING_TEMPDIR_SUFFIX,
     S3_ANALYSIS_BUCKET_NAME,
     S3_ANALYSIS_LOG_BUCKET_NAME,
-    S3_CODE_BUCKET_NAME,
     SPECIAL_ANALYZERS,
 )
-from r2c.lib.infrastructure import Infrastructure
+from r2c.lib.filestore import (
+    FileStore,
+    LocalFilesystemOutputStore,
+    LocalJsonOutputStore,
+    LocalLogStore,
+)
 from r2c.lib.manifest import AnalyzerManifest, AnalyzerOutputType, AnalyzerType
 from r2c.lib.registry import RegistryData
 from r2c.lib.specified_analyzer import SpecifiedAnalyzer
-from r2c.lib.util import (
-    Timeout,
-    cloned_key,
-    get_tmp_dir,
-    handle_readonly_fix,
-    recursive_chmod_777,
-    url_to_repo_id,
-)
+from r2c.lib.util import Timeout, get_tmp_dir, handle_readonly_fix, url_to_repo_id
 from r2c.lib.versioned_analyzer import VersionedAnalyzer
 
 MEMORY_LIMIT = (
     "1536m"
 )  # clean t2.small with unbuntu 18.04 has Mem:           1991          92        1514           0         385        1752
+
+# We need a very small Linux image so we can do some filesystem stuff through
+# Docker.
+ALPINE_IMAGE = "alpine:3.9"
 
 ContainerLog = NewType("ContainerLog", str)
 
@@ -74,24 +72,7 @@ class AnalyzerNonZeroExitError(Exception):
         return self._status_code
 
     def __str__(self):
-        return f"Docker container finished with non-zero exit code: {self._status_code}"
-
-
-class NotFoundInCodeBucket(Exception):
-    """
-        Thrown when cannot find file in code bucket
-    """
-
-    pass
-
-
-class MalformedCodeBucketFile(Exception):
-    """
-        Thrown when file downloaded from code bucket fails to extract
-        or is in an invalid state
-    """
-
-    pass
+        return f"Docker container finished with non-zero exit code: {self._status_code}.\n Container log {self._log}"
 
 
 class AnalyzerImagePullFail(Exception):
@@ -99,15 +80,11 @@ class AnalyzerImagePullFail(Exception):
         Thrown when analyzer image fails to pull
     """
 
-    pass
-
 
 class UnsupportedAnalyzerType(Exception):
     """
         Thrown when unsupported analyzer type is encountered
     """
-
-    pass
 
 
 class InvalidAnalyzerOutput(Exception):
@@ -128,6 +105,12 @@ class InvalidAnalyzerIntegrationTestDefinition(Exception):
         self.inner = inner
 
 
+class UnspecifiedCommitString(Exception):
+    """
+        Thrown when analyzer MPU is given commit string that is not a commit hash
+    """
+
+
 def get_default_analyzer_working_dir():
     return os.path.join(get_tmp_dir(), DEFAULT_ANALYSIS_WORKING_TEMPDIR_SUFFIX)
 
@@ -135,17 +118,23 @@ def get_default_analyzer_working_dir():
 class Analyzer:
     def __init__(
         self,
-        infra: Infrastructure,
         registry_data: RegistryData,
+        json_output_store: FileStore,
+        filesystem_output_store: FileStore,
+        log_store: FileStore,
         localrun: bool = False,
         timeout: int = 1200,
         workdir: str = get_default_analyzer_working_dir(),
     ) -> None:
-        self._infra = infra
         self._registry_data = registry_data
-        self._logger = logging.getLogger("analyzer")
+        self._logger = logging.getLogger(__name__)
+        self._logger.setLevel(logging.INFO)
         self._docker_client = docker.from_env()
         self._timeout = timeout
+
+        self._json_output_store = json_output_store
+        self._filesystem_output_store = filesystem_output_store
+        self._log_store = log_store
 
         # TODO remove once cloner analyzer doesn't need to checkout
         self._localrun = localrun
@@ -267,34 +256,6 @@ class Analyzer:
         key = f"{analyzer_part}/{target_part}"
         return key
 
-    def resolve_commit_string(self, git_url: str, commit_string: str) -> str:
-        """
-            Return commit hash of checking out COMMIT_STRING in GIT_URL
-            where commit_string can be tag, HEAD~1 etc.
-        """
-        if self._localrun:
-            return commit_string
-
-        # TODO do this without downloading repo
-        repo_id = url_to_repo_id(git_url)
-        repo_dir_name = os.path.join(self._workdir, "data", repo_id)
-        self.get_code(git_url, repo_dir_name)
-
-        repo = None
-        try:
-            repo = git.Repo(repo_dir_name)
-        except Exception as e:
-            raise MalformedCodeBucketFile(str(e))
-
-        self._logger.info(f"Checking out {commit_string}")
-        repo.git.checkout(commit_string)
-        commit_hash = repo.head.object.hexsha
-        self._logger.info(f"Has commit hash: {commit_hash}")
-        self._logger.info(f"deleting {repo_dir_name}")
-        shutil.rmtree(repo_dir_name)
-        self._logger.info(f"Commit String {commit_string} has hash {commit_hash}")
-        return commit_hash
-
     def full_analyze_request(
         self,
         git_url: str,
@@ -302,7 +263,8 @@ class Analyzer:
         specified_analyzer: SpecifiedAnalyzer,
         force: bool,
         pass_analyzer_output: bool,
-        wait_for_start: bool = False,
+        interactive_index: Optional[int] = None,
+        interactive_name: Optional[str] = None,
         memory_limit: Optional[str] = None,
         env_args_dict: Optional[dict] = None,
     ) -> dict:
@@ -314,7 +276,7 @@ class Analyzer:
                 git_url: Git repository to analyze
                 commit_string: if not supplied, it will default to HEAD.
                 force: if true, the analysis will proceed even if there is already a cached result for this request.
-                wait_for_start: if true, the last analyzer in the execution graph will wait for user input rather than running automatically.
+                interactive_index: if set, the analyzer in the execution graph (defaults to last if interactive_index not specified)  will drop into shell rather than running automatically.
                 pass_analyzer_output: if true, the analyzer's stdout and stderr will be passed to the current process stdout and stderr, respectively
 
             Returns:
@@ -322,10 +284,10 @@ class Analyzer:
         """
 
         # Analyze head commit by default
-        if not commit_string:
-            commit_string = "HEAD"
+        if not commit_string or "HEAD" in commit_string:
+            raise UnspecifiedCommitString(commit_string)
 
-        commit_hash = self.resolve_commit_string(git_url, commit_string)
+        commit_hash = commit_string
 
         skipped = True
 
@@ -340,56 +302,103 @@ class Analyzer:
 
         container_output_path = ""
         for dependency_index, specified_dependency in enumerate(execution_order):
-            is_last_dependency = dependency_index == len(execution_order) - 1
+            if interactive_index or interactive_index == 0:
+                try:
+                    is_interactive_dependency = (
+                        execution_order[interactive_index] == specified_dependency
+                    )
+
+                except IndexError as e:
+                    self._logger.error(
+                        f"{interactive_index} could not be used as interactive shell index. Stopping Analysis."
+                    )
+                    raise Exception(
+                        f"Could not create interactive shell into dependency at {interactive_index}."
+                    )
+            elif (
+                interactive_name
+                and interactive_name in specified_dependency.versioned_analyzer.name
+            ):
+                is_interactive_dependency = True
+            else:
+                is_interactive_dependency = False
+
+            if is_interactive_dependency:
+                print(
+                    f"Calling `docker exec` into analyzer with name {specified_dependency}"
+                )
+
             dependency = specified_dependency.versioned_analyzer
-            dependency_id = dependency.image_id
             output_s3_key = self.analysis_key(
                 git_url, commit_hash, specified_dependency
             )
 
-            if self._get_manifest(dependency_id).output_type == AnalyzerOutputType.both:
-                json_output_s3_key = f"{output_s3_key}{self._get_analyzer_output_extension(AnalyzerOutputType.json)}"
-                filesystem_output_s3_key = f"{output_s3_key}{self._get_analyzer_output_extension(AnalyzerOutputType.filesystem)}"
-                dependency_exists = self._infra.contains_file(
-                    S3_ANALYSIS_BUCKET_NAME, json_output_s3_key
-                ) and self._infra.contains_file(
-                    S3_ANALYSIS_BUCKET_NAME, filesystem_output_s3_key
+            output_type = self._registry_data.manifest_for(
+                specified_dependency.versioned_analyzer
+            ).output_type
+
+            if output_type == AnalyzerOutputType.both:
+                json_exists = self._json_output_store.contains(
+                    git_url, commit_hash, specified_dependency
+                )
+                filesystem_exists = self._filesystem_output_store.contains(
+                    git_url, commit_hash, specified_dependency
+                )
+                dependency_exists = json_exists and filesystem_exists
+            elif output_type == AnalyzerOutputType.json:
+                dependency_exists = self._json_output_store.contains(
+                    git_url, commit_hash, specified_dependency
+                )
+            elif output_type == AnalyzerOutputType.filesystem:
+                dependency_exists = self._filesystem_output_store.contains(
+                    git_url, commit_hash, specified_dependency
                 )
             else:
-                dependency_exists = self._infra.contains_file(
-                    S3_ANALYSIS_BUCKET_NAME, output_s3_key
-                )
+                raise Exception()
 
             if (
                 # TODO check freshness here
                 dependency_exists
                 and not force
+                and interactive_index is None
+                and interactive_name is None
             ):
+                # use cache when non-interactive, non-forcing, dependency
                 self._logger.info(
-                    f"Analysis for {git_url} {commit_string} {dependency_id} already exists. Keeping old analysis report"
+                    f"Analysis for {git_url} {commit_string} {specified_dependency} already exists. Keeping old analysis report"
                 )
             else:
                 self._logger.info(
                     f"Running: {dependency.name}, {dependency.version}..."
                 )
-                mount_folder, container_log = self._analyze(
-                    specified_dependency,
-                    git_url,
-                    commit_hash,
-                    wait_for_start=wait_for_start and is_last_dependency,
-                    pass_analyzer_output=pass_analyzer_output,
-                    memory_limit=memory_limit,
-                    env_args_dict=env_args_dict,
-                )
+
+                try:
+                    mount_folder, container_log = self._analyze(
+                        specified_dependency,
+                        git_url,
+                        commit_hash,
+                        interactive=is_interactive_dependency,
+                        pass_analyzer_output=pass_analyzer_output,
+                        memory_limit=memory_limit,
+                        env_args_dict=env_args_dict,
+                    )
+                except AnalyzerNonZeroExitError as e:
+                    # Upload log then raise
+                    self._logger.info(
+                        "AnalyzerNonZeroExitError caught. Uploading Container Log."
+                    )
+                    container_log = e.log
+                    self._log_store.write(
+                        git_url, commit_hash, specified_dependency, container_log
+                    )
+                    raise e
 
                 self._logger.info("Analyzer finished running.")
                 self._logger.info("Uploading analyzer log")
-                log_key = self.container_log_key(
-                    git_url, commit_hash, dependency.image_id
+                self._log_store.write(
+                    git_url, commit_hash, specified_dependency, container_log
                 )
-                self._infra.put_object(
-                    S3_ANALYSIS_LOG_BUCKET_NAME, container_log, log_key
-                )
+
                 self._logger.info("Uploading analyzer output")
                 container_output_path = self.upload_output(
                     specified_dependency, git_url, commit_hash, mount_folder
@@ -430,6 +439,10 @@ class Analyzer:
             manifest.output.validator(output).validate(output)
         except jsonschema.ValidationError as err:
             raise InvalidAnalyzerOutput(err) from err
+        except Exception as err:
+            raise RuntimeError(
+                f"There was an error validating your output. Please check that you're outputing a valid output and try again: {err}"
+            )
 
     def upload_output(
         self,
@@ -455,16 +468,18 @@ class Analyzer:
                 InvalidAnalyzerOutput: if output fails to validate
                                        note that output is still uploaded
         """
-        image_id = specified_analyzer.versioned_analyzer.image_id
-        output_type = self._get_manifest(image_id).output_type
+        manifest = self._registry_data.manifest_for(
+            specified_analyzer.versioned_analyzer
+        )
+        output_type = manifest.output_type
         if output_type == AnalyzerOutputType.json:
             output_s3_key = self.analysis_key(git_url, commit_hash, specified_analyzer)
             output_file_path = self.get_analyzer_output_path(mount_folder, output_type)
             self._logger.info(
                 f"Uploading {output_file_path} to {S3_ANALYSIS_BUCKET_NAME} with key {output_s3_key}"
             )
-            self._infra.put_file(
-                S3_ANALYSIS_BUCKET_NAME, output_file_path, output_s3_key
+            self._json_output_store.put(
+                git_url, commit_hash, specified_analyzer, output_file_path
             )
         elif output_type == AnalyzerOutputType.filesystem:
             output_s3_key = self.analysis_key(git_url, commit_hash, specified_analyzer)
@@ -478,8 +493,8 @@ class Analyzer:
             self._logger.info(
                 f"Uploading {output_file_path} to {S3_ANALYSIS_BUCKET_NAME} with key {output_s3_key}"
             )
-            self._infra.put_file(
-                S3_ANALYSIS_BUCKET_NAME, output_file_path, output_s3_key
+            self._filesystem_output_store.put(
+                git_url, commit_hash, specified_analyzer, output_file_path
             )
         elif output_type == AnalyzerOutputType.both:
             filesystem_output_s3_key = self.analysis_key(
@@ -504,17 +519,15 @@ class Analyzer:
             self._logger.info(
                 f"Uploading {json_output_file_path} to {S3_ANALYSIS_BUCKET_NAME} with key {json_output_s3_key}"
             )
-            self._infra.put_file(
-                S3_ANALYSIS_BUCKET_NAME, json_output_file_path, json_output_s3_key
+            self._json_output_store.put(
+                git_url, commit_hash, specified_analyzer, json_output_file_path
             )
 
             self._logger.info(
                 f"Uploading {filesystem_output_file_path} to {S3_ANALYSIS_BUCKET_NAME} with key {filesystem_output_s3_key}"
             )
-            self._infra.put_file(
-                S3_ANALYSIS_BUCKET_NAME,
-                filesystem_output_file_path,
-                filesystem_output_s3_key,
+            self._filesystem_output_store.put(
+                git_url, commit_hash, specified_analyzer, filesystem_output_file_path
             )
 
             output_file_path = json_output_file_path
@@ -525,64 +538,8 @@ class Analyzer:
 
         # Invalid outputs should still be uploaded, but we want to
         # count them as failing.
-        self._validate_output(self._get_manifest(image_id), mount_folder)
+        self._validate_output(manifest, mount_folder)
         return output_file_path
-
-    def get_code(self, git_url, dst):
-        """
-            Gets code for REPO_ID from S3, unzips, deletes zip file
-
-            Raises:
-                NotFoundInCodeBucket: if code for GIT_URL is not found in S3_CODE_BUCKET_NAME
-                MalformedCodeBucketFile: if code found does not extract properly
-        """
-        repo_id = url_to_repo_id(git_url)
-        repo_tar_name = os.path.join(self._workdir, f"{repo_id}.tar.gz")
-        repo_s3_key = cloned_key(git_url)
-
-        # Repo should not already exist. Probably invalid state. Best to just clean
-        if pathlib.Path(repo_tar_name).exists():
-            self._logger.info(f"{repo_tar_name} already exists. Deleting.")
-            os.remove(repo_tar_name)
-        if pathlib.Path(dst).exists():
-            self._logger.info(f"{dst} already exists. Deleting")
-            shutil.rmtree(dst)
-
-        self._logger.info(
-            f"Downloading {repo_s3_key} from {S3_CODE_BUCKET_NAME} to {repo_tar_name}"
-        )
-        if not self._infra.get_file(S3_CODE_BUCKET_NAME, repo_s3_key, repo_tar_name):
-            self._logger.error(f"key {repo_s3_key} not found in {S3_CODE_BUCKET_NAME}")
-            raise NotFoundInCodeBucket(
-                f"key {repo_s3_key} not found in {S3_CODE_BUCKET_NAME}"
-            )
-
-        self._logger.info(f"Extracting to {dst}")
-
-        try:
-            with tarfile.open(repo_tar_name) as tar:
-                tar.extractall(os.path.join(self._workdir, "data"))
-                # This is only because the thing extracted from the tar is in a
-                # directory named repo_id. Cloner should be changed to just have it
-                # not have an extra directory level
-                os.rename(os.path.join(self._workdir, "data", repo_id), dst)
-        except Exception as e:
-            raise MalformedCodeBucketFile(str(e))
-
-        os.remove(repo_tar_name)
-
-    @staticmethod
-    def analyzer_name(image_id):
-        """
-
-        """
-        return VersionedAnalyzer.from_image_id(image_id).name
-
-    @staticmethod
-    def analyzer_version(image_id):
-        """
-        """
-        return VersionedAnalyzer.from_image_id(image_id).version
 
     def prepare_mount_volume(
         self, specified_analyzer: SpecifiedAnalyzer, git_url: str, commit_hash: str
@@ -604,9 +561,7 @@ class Analyzer:
         now_ts = datetime.utcnow().isoformat().replace(":", "").replace("-", "")
         image_id = specified_analyzer.versioned_analyzer.image_id
         safe_image_id = image_id.split("/")[-1].replace(":", "__")
-        mount_folder = os.path.join(
-            self._workdir, f"{safe_image_id}__{commit_hash}__{now_ts}"
-        )
+        mount_folder = os.path.join(self._workdir, f"{safe_image_id}__{now_ts}")
 
         self._logger.info("Setting up volumes for analyzer container.")
         self._logger.info(f"Will mount: {mount_folder}")
@@ -618,10 +573,11 @@ class Analyzer:
         output_dir = os.path.join(mount_folder, "output")
         pathlib.Path(input_dir).mkdir(parents=True, exist_ok=True)
         pathlib.Path(output_dir).mkdir(parents=True, exist_ok=True)
+        os.chmod(output_dir, 0o777)
         # TODO why should this only be done if we expect fs?
-        pathlib.Path(os.path.join(mount_folder, "output", "fs")).mkdir(
-            parents=True, exist_ok=True
-        )
+        fs_dir = os.path.join(output_dir, "fs")
+        pathlib.Path(fs_dir).mkdir(parents=True, exist_ok=True)
+        os.chmod(fs_dir, 0o777)
 
         # Setup Parameters
         with open(os.path.join(input_dir, "parameters.json"), "w") as parameters_file:
@@ -631,13 +587,13 @@ class Analyzer:
             specified_analyzer.versioned_analyzer
         )
 
-        if self.analyzer_name(image_id) in SPECIAL_ANALYZERS:
+        if specified_analyzer.versioned_analyzer.name in SPECIAL_ANALYZERS:
             with open(input_dir + "/cloner-input.json", "w") as argument_file:
                 arguments = {"git_url": git_url, "commit_hash": commit_hash}
                 json.dump(arguments, argument_file)
                 success = True
 
-        if self.analyzer_name(image_id) == "r2c/full-cloner":
+        if specified_analyzer.versioned_analyzer.name == "r2c/full-cloner":
             with open(input_dir + "/cloner-input.json", "w") as argument_file:
                 arguments = {"git_url": git_url}
                 json.dump(arguments, argument_file)
@@ -646,9 +602,6 @@ class Analyzer:
         self._logger.info(f"Loading dependencies' outputs: {dependencies}")
         for specified_dependency in dependencies:
             self._logger.info(f"Loading output of {specified_dependency}")
-            self._logger.info(
-                f"Has image_id: {specified_dependency.versioned_analyzer.image_id}"
-            )
 
             output_type = self._registry_data.manifest_for(
                 specified_dependency.versioned_analyzer
@@ -666,15 +619,16 @@ class Analyzer:
             ).mkdir(parents=True, exist_ok=True)
 
             if output_type == AnalyzerOutputType.json:
-                success = self._infra.get_file(
-                    S3_ANALYSIS_BUCKET_NAME,
-                    dependency_key,
+                success = self._json_output_store.get(
+                    git_url,
+                    commit_hash,
+                    specified_dependency,
                     f"{input_dir}/{specified_dependency.versioned_analyzer.name}.json",
                 )
             elif output_type == AnalyzerOutputType.filesystem:
                 fs_input_tar = os.path.join(input_dir, "output.tar.gz")
-                if self._infra.get_file(
-                    S3_ANALYSIS_BUCKET_NAME, dependency_key, fs_input_tar
+                if self._filesystem_output_store.get(
+                    git_url, commit_hash, specified_dependency, fs_input_tar
                 ):
                     self._logger.info(f"Extracting filesystem dependency")
                     with tarfile.open(fs_input_tar) as tar:
@@ -687,9 +641,10 @@ class Analyzer:
                 json_output_s3_key = self.analysis_key(
                     git_url, commit_hash, specified_dependency, AnalyzerOutputType.json
                 )
-                json_success = self._infra.get_file(
-                    S3_ANALYSIS_BUCKET_NAME,
-                    json_output_s3_key,
+                json_success = self._json_output_store.get(
+                    git_url,
+                    commit_hash,
+                    specified_dependency,
                     f"{input_dir}/{specified_dependency.versioned_analyzer.name}.json",
                 )
 
@@ -700,8 +655,8 @@ class Analyzer:
                     AnalyzerOutputType.filesystem,
                 )
                 fs_input_tar = os.path.join(input_dir, "output.tar.gz")
-                if self._infra.get_file(
-                    S3_ANALYSIS_BUCKET_NAME, filesystem_output_s3_key, fs_input_tar
+                if self._filesystem_output_store.get(
+                    git_url, commit_hash, specified_dependency, fs_input_tar
                 ):
                     self._logger.info(f"Extracting filesystem dependency")
                     with tarfile.open(fs_input_tar) as tar:
@@ -736,7 +691,7 @@ class Analyzer:
         self,
         image_id: str,
         mount_folder: str,
-        wait_for_start: bool,
+        interactive: bool,
         pass_analyzer_output: bool,
         memory_limit: Optional[str],
         env_args_dict: Optional[dict] = None,
@@ -749,7 +704,7 @@ class Analyzer:
                 mount_folder: path to directory we will mount as /analysis. In analyzer spec v3
                 this is the directory that contains inputs/ and output. Assumes this directory is
                 properly prepared
-                wait_for_start: if true, change the run command so that it will wait infinitely instead of running the original Dockerfile CMD. Useful for debugging.
+                interactive: if true, change the run command so that it drops into bash shell. Useful for debugging.
                 memory_limit: memory limit for container, e.g. '2G'
             Raises:
                 AnalyzerImagePullFail: if IMAGE_ID is not available and fails to pull
@@ -764,24 +719,26 @@ class Analyzer:
                 self._docker_client.images.pull(image_id)
             except Exception as e:
                 raise AnalyzerImagePullFail(str(e))
+        self._docker_client.images.pull(ALPINE_IMAGE)
         container = None
 
-        # Prepare mount_folder to mount as volume to docker
-        self._logger.info("Setup volume permissions")
-
-        if self._localrun:
-            recursive_chmod_777(mount_folder)
-        else:
-            # Still need sudo? https://github.com/returntocorp/echelon-backend/issues/2690
-            subprocess.call(["sudo", "chmod", "-R", "777", mount_folder])
-
-        volumes = {}
         VOLUME_MOUNT_IN_DOCKER = "/analysis"
-        volumes[mount_folder] = {"bind": VOLUME_MOUNT_IN_DOCKER, "mode": "rw"}
 
         # we can't use volume mounting with remote docker (for example, on
         # CircleCI), have to docker cp
         is_remote_docker = os.environ.get("DOCKER_HOST") is not None
+
+        if is_remote_docker:
+            self._logger.info("Remote docker client; using docker cp")
+            manager: AbstractDockerFileManager = RemoteDockerFileManager(
+                self._docker_client, mount_folder
+            )
+        else:
+            manager = LocalDockerFileManager(self._docker_client, mount_folder)
+
+        if is_remote_docker and interactive:
+            self._logger.error("Wait for start not supported with remote docker client")
+            interactive = False
 
         env_vars = (
             " ".join([f"-e {k}={v}" for k, v in env_args_dict.items()])
@@ -791,41 +748,30 @@ class Analyzer:
         self._logger.info(
             f"""Running container {image_id} (memory limit: {memory_limit}): \n\t: debug with docker run {env_vars} --volume "{mount_folder}:{VOLUME_MOUNT_IN_DOCKER}" {image_id}"""
         )
+
         try:
             with Timeout(self._timeout):
-                if is_remote_docker:
-                    self._logger.warning(
-                        "Remote docker client, so volume mounts will not work--falling back to docker shell and cp'ing files"
-                    )
-                    if wait_for_start:
-                        self._logger.error(
-                            "Wait for start not supported with remote docker client"
-                        )
-                    container = self._docker_client.containers.create(
-                        image_id,
-                        volumes=None,
-                        mem_limit=memory_limit if memory_limit else None,
-                        environment=env_args_dict,
-                    )
-                    subprocess.check_output(
-                        f'''docker cp "{mount_folder}/." {container.id}:"{VOLUME_MOUNT_IN_DOCKER}"''',
-                        shell=True,
-                    )
-                    subprocess.check_output(f"docker start {container.id}", shell=True)
-                else:
-                    container = self._docker_client.containers.run(
-                        image_id,
-                        volumes=volumes,
-                        detach=True,
-                        command="tail -f /dev/null" if wait_for_start else None,
-                        mem_limit=memory_limit if memory_limit else None,
-                        environment=env_args_dict,
-                    )
+                container = self._docker_client.containers.create(
+                    image_id,
+                    volumes=manager.volumes(),
+                    command="tail -f /dev/null" if interactive else None,
+                    mem_limit=memory_limit if memory_limit else None,
+                    environment=env_args_dict,
+                )
 
-                if wait_for_start:
+                # Set up the VOLUME_MOUNT_IN_DOCKER.
+                manager.copy_input()
+
+                container.start()
+
+                if interactive:
                     self._logger.info(
-                        f"\n\nYour action required, container is ready: run\n\tdocker exec -i -t {container.id} /bin/bash"
+                        f"\n\nYour container is ready: running \n\tdocker exec -i -t {container.id} /bin/sh"
                     )
+                    subprocess.call(
+                        f"docker exec -i -t {container.id} /bin/sh", shell=True
+                    )
+                    sys.exit(1)
 
                 # launch two threads to display stdout and stderr while the container is running
                 if pass_analyzer_output:
@@ -857,25 +803,11 @@ class Analyzer:
                 container_log = container.logs(stdout=True, stderr=True).decode("utf-8")
                 # self._logger.info(f"Container output: {container_log}")
 
-                if is_remote_docker:
-                    self._logger.warning(
-                        "Remote docker client, so volume mounts will not work--using cp to copying files out of container"
-                    )
-                    # c.f. https://docs.docker.com/engine/reference/commandline/cp/#extended-description for significance of /.
-                    subprocess.check_output(
-                        f'docker cp {container.id}:"{VOLUME_MOUNT_IN_DOCKER}/." "{mount_folder}"',
-                        shell=True,
-                    )
+                manager.copy_output()
+                manager.teardown()
 
                 container.remove()
                 container = None
-
-                # Change permissions of any new file added by container
-                if self._localrun:
-                    recursive_chmod_777(mount_folder)
-                else:
-                    # Still need sudo? https://github.com/returntocorp/echelon-backend/issues/2690
-                    subprocess.call(["sudo", "chmod", "-R", "777", mount_folder])
 
             if status_code != 0:
                 self._logger.exception(
@@ -886,17 +818,6 @@ class Analyzer:
         except Exception as e:
             self._logger.exception(f"There was an error running {image_id}: {e}")
 
-            if os.path.exists(mount_folder):
-                self._logger.info(f"deleting {mount_folder}")
-                # Change permissions of any new file added by container
-                if self._localrun:
-                    recursive_chmod_777(mount_folder)
-                else:
-                    # Still need sudo? https://github.com/returntocorp/echelon-backend/issues/2690
-                    subprocess.call(["sudo", "chmod", "-R", "777", mount_folder])
-
-                shutil.rmtree(mount_folder, ignore_errors=True)
-
             if container:
                 self._logger.info(f"killing container {container.id}")
                 try:
@@ -905,6 +826,14 @@ class Analyzer:
                     self._logger.info(f"successfully killed container {container.id}")
                 except Exception:
                     self._logger.exception("error killing container")
+
+            if os.path.exists(mount_folder):
+                self._logger.info(f"deleting {mount_folder}")
+                manager._set_permissions()
+
+                shutil.rmtree(mount_folder, ignore_errors=True)
+
+            manager.teardown()
 
             raise e
 
@@ -915,20 +844,20 @@ class Analyzer:
         specified_analyzer: SpecifiedAnalyzer,
         git_url: str,
         commit_hash: str,
-        wait_for_start: bool,
+        interactive: bool,
         pass_analyzer_output: bool,
         memory_limit: Optional[str],
         env_args_dict: Optional[dict] = None,
     ) -> Tuple[str, ContainerLog]:
         """
-            Run IMAGE_ID analyzer on GIT_URL @ COMMIT_HASH, retreiving dependencies from self._infra
+            Run IMAGE_ID analyzer on GIT_URL @ COMMIT_HASH, retreiving dependencies cache
             as necessary.
 
             Args:
                 specified_analyzer: uniquely identifies docker container to run w/ args
                 git_url: url of code
                 commit_hash: hash of code to analyze at
-                wait_for_start: See run_image_on_folder
+                interactive: See run_image_on_folder
                 pass_analyzer_output: See run_image_on_folder
                 memory_limit: See run_image_on_folder
                 env_args_dict: See run_image_on_folder
@@ -948,14 +877,111 @@ class Analyzer:
         container_log = self.run_image_on_folder(
             image_id=specified_analyzer.versioned_analyzer.image_id,
             mount_folder=mount_folder,
-            wait_for_start=wait_for_start,
+            interactive=interactive,
             pass_analyzer_output=pass_analyzer_output,
             memory_limit=memory_limit,
             env_args_dict=env_args_dict,
         )
         return (mount_folder, container_log)
 
-    def _get_manifest(self, image_id: str) -> AnalyzerManifest:
-        """The manifest for this analyzer."""
-        analyzer = VersionedAnalyzer.from_image_id(image_id)
-        return self._registry_data.manifest_for(analyzer)
+
+VOLUME_MOUNT_IN_DOCKER = "/analysis"
+
+
+class AbstractDockerFileManager(abc.ABC):
+    """Base class for helpers for analyzer input/output."""
+
+    @abc.abstractmethod
+    def copy_input(self):
+        """Copies the input from the host to the container."""
+
+    @abc.abstractmethod
+    def copy_output(self):
+        """Copies the input from the host to the container."""
+
+    def _set_permissions(self):
+        """Makes everything in the volume/bind mount world-readable."""
+        self._docker_client.containers.run(
+            ALPINE_IMAGE,
+            f'chmod -R 0777 "{VOLUME_MOUNT_IN_DOCKER}"',
+            volumes=self.volumes(),
+        )
+
+    @abc.abstractmethod
+    def volumes(self) -> Dict[str, dict]:
+        """The volumes to be mounted."""
+
+    @abc.abstractmethod
+    def teardown(self):
+        """Must be called when we're done with docker."""
+
+
+class LocalDockerFileManager(AbstractDockerFileManager):
+    """Bind-mounts a local file. Fast, but does not work with remote docker."""
+
+    def __init__(self, docker_client, mount_folder):
+        """mount_folder is the host folder to be mounted in the container."""
+        self._docker_client = docker_client
+        self._mount_folder = mount_folder
+
+    # Since we use a bind mount, we don't need to do anything special to copy files.
+    def copy_input(self):
+        self._set_permissions()
+
+    def copy_output(self):
+        self._set_permissions()
+
+    def volumes(self) -> Dict[str, dict]:
+        return {self._mount_folder: {"bind": VOLUME_MOUNT_IN_DOCKER, "mode": "rw"}}
+
+    def teardown(self):
+        pass
+
+
+class RemoteDockerFileManager(AbstractDockerFileManager):
+    """Explicitly sets up a volume. Slower, but works with remote docker."""
+
+    def __init__(self, docker_client, mount_folder):
+        """mount_folder is the host folder to be mounted in the container."""
+        self._docker_client = docker_client
+        self._mount_folder = mount_folder
+        self._volume = self._docker_client.volumes.create()
+        # A Docker container that we'll use to copy files in and out.
+        self._dummy = self._docker_client.containers.create(
+            ALPINE_IMAGE,
+            command=f'chmod -R 0777 "{VOLUME_MOUNT_IN_DOCKER}"',
+            volumes=self.volumes(),
+        )
+
+    def copy_input(self):
+        # Weirdly, there doesn't appear to be a nice way to do this
+        # from within the Python API.
+        subprocess.check_output(
+            [
+                "docker",
+                "cp",
+                f"{self._mount_folder}/.",
+                f"{self._dummy.id}:{VOLUME_MOUNT_IN_DOCKER}",
+            ]
+        )
+        self._set_permissions()
+
+    def copy_output(self):
+        self._set_permissions()
+        # Weirdly, there doesn't appear to be a nice way to do this
+        # from within the Python API.
+        subprocess.check_output(
+            [
+                "docker",
+                "cp",
+                f"{self._dummy.id}:{VOLUME_MOUNT_IN_DOCKER}/.",
+                f"{self._mount_folder}",
+            ]
+        )
+        self._set_permissions()
+
+    def volumes(self) -> Dict[str, dict]:
+        return {self._volume.name: {"bind": VOLUME_MOUNT_IN_DOCKER, "mode": "rw"}}
+
+    def teardown(self):
+        self._dummy.remove()

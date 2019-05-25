@@ -1,4 +1,5 @@
 import json
+import logging
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union
 
@@ -7,7 +8,12 @@ from mypy_extensions import TypedDict
 from semantic_version import Version
 
 from r2c.lib import manifest_migrations, schemas
+from r2c.lib.schemas import SPEC_VERSION
 from r2c.lib.versioned_analyzer import AnalyzerName
+
+logger = logging.getLogger(__name__)
+
+logger = logging.getLogger(__name__)
 
 
 class AnalyzerType(Enum):
@@ -64,11 +70,16 @@ class AnalyzerManifestJson(_AnalyzerManifestJsonBase, total=False):
 
 class AnalyzerDependency:
     def __init__(
-        self, name: AnalyzerName, wildcard_version: str, parameters: Any = {}
+        self,
+        name: AnalyzerName,
+        wildcard_version: str,
+        parameters: Any = {},
+        path: str = None,
     ) -> None:
         self._name = name
         self._wildcard_version = wildcard_version
         self._parameters = parameters
+        self._path = path
 
     @property
     def name(self) -> AnalyzerName:
@@ -82,8 +93,21 @@ class AnalyzerDependency:
     def parameters(self) -> Any:
         return self._parameters
 
+    @property
+    def path(self) -> Optional[str]:
+        return self._path
+
+    @path.setter
+    def path(self, path: str) -> None:
+        self._path = path
+
     def __str__(self) -> str:
-        return f"{self.name}:{self.wildcard_version} --- params: {self.parameters}"
+        dep_str = f"{self.name}:{self.wildcard_version}"
+        if self.parameters:
+            dep_str += f"--- params: {self.parameters}"
+        if self.path:
+            dep_str += f"--- path: {self.path}"
+        return dep_str
 
 
 class AnalyzerOutput:
@@ -184,6 +208,10 @@ class AnalyzerManifest:
     def version(self) -> Version:
         return self._version
 
+    @version.setter
+    def version(self, version: Version) -> None:
+        self._version = version
+
     @property
     def original_spec_version(self) -> Version:
         return self._original_spec_version
@@ -195,6 +223,11 @@ class AnalyzerManifest:
             These can be absolute versions or ranges and must be resolved.
         """
         return self._dependencies
+
+    @dependencies.setter
+    def dependencies(self, dependencies: List[AnalyzerDependency]) -> None:
+        """ Setter for _dependencies """
+        self._dependencies = dependencies
 
     @property
     def analyzer_type(self) -> AnalyzerType:
@@ -212,7 +245,21 @@ class AnalyzerManifest:
     def deterministic(self) -> bool:
         return self._deterministic
 
-    def to_json(self) -> AnalyzerManifestJson:
+    @property
+    def is_locally_linked(self) -> bool:
+        """ Return if any dependency is locally linked """
+        return any([dep.path for dep in self._dependencies])
+
+    def to_json(self) -> Dict[str, Any]:
+        """A JSON representation of this manifest.
+
+        If this was constructed from a JSON object via `from_json`, that object
+        is returned. If constructed via the constructor, creates a new JSON
+        object and returns that.
+        """
+        if self._original_json is not None:
+            return self._original_json
+
         dependencies: Dict[str, Any] = {}
         for dependency in self._dependencies:
             if len(dependency.parameters) == 0:
@@ -223,7 +270,7 @@ class AnalyzerManifest:
                     "parameters": dependency.parameters,
                 }
 
-        json_obj: AnalyzerManifestJson = {
+        json_obj: Dict[str, Any] = {
             "analyzer_name": str(self._analyzer_name),
             "version": str(self._version),
             "spec_version": self._spec_version,
@@ -242,45 +289,46 @@ class AnalyzerManifest:
             json_obj["extra"] = self._extra
         return json_obj
 
-    def to_original_json(self) -> Dict[str, Any]:
-        """The original JSON object this was constructed from.
-        This is useful for displaying error messages to the user, since the
-        output of to_json_obj() may not correspond to the user's input in cases
-        of migration, default values, etc.
-        Returns None if this was constructed directly.
-        """
-        return self._original_json
-
     @classmethod
     def from_json(cls, json_obj: Dict[str, Any]) -> "AnalyzerManifest":
         # The type of the json_obj argument is a bit of a hack, since in
         # r2c.lib.registry we cast an arbitrary dict to an AnalyzerManifestJson
         # before calling this.
 
-        # TODO Skipping validation for 2.0.0 spec for now tracking: #2796
         spec_version = json_obj.get("spec_version")
-        if spec_version != "2.0.0":
-            if spec_version is None:
-                raise MalformedManifestException(
-                    json_obj, "Must specify a spec_version field"
-                )
-            validator = schemas.manifest_validator(json_obj)
-            if validator is None:
-                raise MalformedManifestException(
-                    json_obj,
-                    "Could not find a schema for the given spec_version {}".format(
-                        spec_version
-                    ),
-                )
-            try:
-                validator.validate(json_obj)
-            except jsonschema.ValidationError as err:
-                raise MalformedManifestException(json_obj, err.message) from err
+        if spec_version is None:
+            raise MalformedManifestException(
+                json_obj, "Must specify a spec_version field"
+            )
+
+        if Version(spec_version).major > SPEC_VERSION.major:
+            logger.error(
+                f"Trying to parse manifest for analyzer {json_obj['analyzer_name']}:{json_obj['version']}"
+                f" with spec_version: {spec_version}, but that spec_version is"
+                f" too new and not compatible with the latest supported: {SPEC_VERSION}."
+            )
+            raise IncompatibleManifestException(
+                f"Can't parse manifest for analyzer {json_obj['analyzer_name']}:{json_obj['version']}"
+                f" with spec_version: {spec_version}. The spec_version is"
+                f" incompatible with the latest supported: {SPEC_VERSION}."
+            )
+
+        validator = schemas.manifest_validator(json_obj)
+        if validator is None:
+            raise MalformedManifestException(
+                json_obj,
+                "Could not find a schema for the given spec_version {}".format(
+                    spec_version
+                ),
+            )
+        try:
+            validator.validate(json_obj)
+        except jsonschema.ValidationError as err:
+            raise MalformedManifestException(json_obj, err.message) from err
 
         original_json_obj = json_obj
-        # TODO remove migration for 2.0.0. Tracking #2796
-        if spec_version != "2.0.0":
-            json_obj = manifest_migrations.migrate(json_obj)
+
+        json_obj = manifest_migrations.migrate(json_obj)
         original_version = (
             Version(json_obj["_original_spec_version"])
             if json_obj.get("_original_spec_version")
@@ -290,16 +338,20 @@ class AnalyzerManifest:
         dependencies = []
         for dependency_name, value in json_obj["dependencies"].items():
             if isinstance(value, str):
+                # if value is string, assume its Semver version
                 dependencies.append(
-                    AnalyzerDependency(AnalyzerName(dependency_name), value)
+                    AnalyzerDependency(
+                        AnalyzerName(dependency_name), wildcard_version=value
+                    )
                 )
             else:
-                # Follows
+                # If value is an object, parse it for params, version, path
                 dependencies.append(
                     AnalyzerDependency(
                         AnalyzerName(dependency_name),
-                        value["version"],
-                        value["parameters"],
+                        value.get("version"),
+                        value.get("parameters"),
+                        value.get("path"),
                     )
                 )
         return cls(
@@ -343,4 +395,17 @@ class InvalidManifestException(Exception):
 
 
 class ManifestNotFoundException(Exception):
+    pass
+
+
+class IncompatibleManifestException(Exception):
+    pass
+
+
+# Local-linking specific exceptions
+class InvalidLocalPathException(Exception):
+    pass
+
+
+class LinkedAnalyzerNameMismatch(Exception):
     pass

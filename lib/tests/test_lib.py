@@ -1,6 +1,6 @@
-from semantic_version import Version
+import pytest
 
-from r2c.lib.manifest import AnalyzerManifest
+from r2c.lib.manifest import AnalyzerManifest, IncompatibleManifestException
 from r2c.lib.manifest_migrations import migrate
 
 
@@ -17,7 +17,7 @@ def test_migrate_to_1_1_0():
     expected = {
         "analyzer_name": "com.returntocorp.identify-language",
         "version": "0.5.4",
-        "spec_version": "1.2.0",
+        "spec_version": "2.1.0",
         "dependencies": {"com.returntocorp.cloner": "*"},
         "type": "commit",
         "output": {"type": "json"},
@@ -31,7 +31,7 @@ def test_migrate_input_is_latest():
     spec = {
         "analyzer_name": "com.returntocorp.identify-language",
         "version": "0.5.4",
-        "spec_version": "1.2.0",
+        "spec_version": "2.1.0",
         "dependencies": {"com.returntocorp.cloner": "*"},
         "type": "commit",
         "output": {"type": "json"},
@@ -64,5 +64,5 @@ def test_spec_using_version_later_than_latest():
         "output": {"type": "json"},
         "deterministic": True,
     }
-    manifest = AnalyzerManifest.from_json(spec)
-    assert manifest.original_spec_version == Version("999.999.999")
+    with pytest.raises(IncompatibleManifestException):
+        manifest = AnalyzerManifest.from_json(spec)

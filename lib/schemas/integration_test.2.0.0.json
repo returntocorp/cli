@@ -1,0 +1,30 @@
+{
+  "$id": "file:///integration_test.1.0.0.json",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+
+  "properties": {
+    "target": {
+      "type": "string"
+    },
+    "target_hash": {
+      "type": "string"
+    },
+    "parameters": {
+      "_comment": "NOT IMPLEMENTED YET",
+      "type": "object"
+    },
+    "expected": {
+      "type": "array",
+      "items": {
+        "$ref": "file:///analyzer_output.1.0.0.json#/definitions/result"
+      }
+    },
+    "_comment": {
+      "type": "string"
+    }
+  },
+
+  "required": ["target", "target_hash", "expected"],
+  "additionalProperties": false
+}

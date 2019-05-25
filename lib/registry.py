@@ -1,8 +1,7 @@
 import copy
 import json
 import logging
-import time
-import traceback
+import os
 from typing import Any, Dict, Generic, List, Optional, Tuple, TypeVar, cast
 
 import requests
@@ -10,12 +9,13 @@ from mypy_extensions import TypedDict
 from semantic_version import Spec, Version
 from toposort import CircularDependencyError, toposort, toposort_flatten
 
-from r2c.lib.infrastructure import Infrastructure
 from r2c.lib.manifest import (
     AnalyzerManifest,
     AnalyzerManifestJson,
     AnalyzerOutputType,
     AnalyzerType,
+    IncompatibleManifestException,
+    InvalidLocalPathException,
     InvalidManifestException,
     MalformedManifestException,
     ManifestNotFoundException,
@@ -84,7 +84,7 @@ class ManifestWithState:
         return cls(AnalyzerManifest.from_json(manifest_json), pending)
 
     def to_json(self) -> ManifestWithStateJson:
-        return {"manifest": self._manifest.to_original_json(), "pending": self._pending}
+        return {"manifest": self._manifest.to_json(), "pending": self._pending}
 
     def __str__(self) -> str:
         return json.dumps(self.to_json())
@@ -124,15 +124,19 @@ class AnalyzerData:
     def from_json(cls, json_obj: AnalyzerDataJson) -> "AnalyzerData":
         versions_json = json_obj.get("versions")
         public = json_obj.get("public")
-        if not versions_json or public is None or type(public) != bool:
+        if versions_json is None or public is None or type(public) != bool:
             raise Exception(f"Unable to parse AnalyzerData from {json_obj}")
-        return cls(
-            {
-                Version(version): ManifestWithState.from_json(manifest_with_state_json)
-                for version, manifest_with_state_json in versions_json.items()
-            },
-            public,
-        )
+
+        version_to_manifest = {}
+        for version, manifest_with_state_json in versions_json.items():
+            try:
+                manifest_with_state = ManifestWithState.from_json(
+                    manifest_with_state_json
+                )
+                version_to_manifest[Version(version)] = manifest_with_state
+            except IncompatibleManifestException:
+                logging.warning(f"Skipping this manifest: {manifest_with_state_json}")
+        return cls(version_to_manifest, public)
 
 
 RegistryDataJson = Dict[str, AnalyzerDataJson]
@@ -216,7 +220,9 @@ class RegistryData:
         new_reg._data.update(other._data)
         return new_reg
 
-    def add_pending_manifest(self, manifest: AnalyzerManifest) -> "RegistryData":
+    def add_pending_manifest(
+        self, manifest: AnalyzerManifest, force: bool = False
+    ) -> "RegistryData":
         """
             Add this manifest into the current registry data as pending upload.
             This method first verifies that:
@@ -227,6 +233,8 @@ class RegistryData:
 
             Arguments:
                 manifest: The manifest of the analyzer we want to add to the registry
+                force: Force overwrite into registry if manifest already exists with matching name.
+                    This flag nullifies the InvalidManifestException thrown for manifest that already exists
 
             Returns:
                 A new RegistryData object with manifest added in.
@@ -252,15 +260,20 @@ class RegistryData:
                 raise InvalidManifestException(
                     f"Resolving this dependency: {dep} But analyzer can't depend on itself."
                 )
-
             resolved_version = new_reg._resolve(
                 AnalyzerName(dep.name), dep.wildcard_version
             )
 
-            if resolved_version is None:
-                raise InvalidManifestException(
-                    f"A dependency in this manifest cannot be resolved: {dep}"
-                )
+            if dep.path:
+                if not os.path.isdir(dep.path) or not os.path.exists(dep.path):
+                    raise InvalidLocalPathException(
+                        f"A dependency in this manifest cannot be resolved: {dep}"
+                    )
+            else:
+                if resolved_version is None:
+                    raise InvalidManifestException(
+                        f"A dependency in this manifest cannot be resolved: {dep}"
+                    )
 
         # Check that we don't already have a manifest for it.
         # i.e. don't allow a new manifest without changing analyzer version.
@@ -268,9 +281,10 @@ class RegistryData:
         analyzer_data = self._data.get(name)
         if analyzer_data:
             if version in analyzer_data.versions.keys():
-                raise InvalidManifestException(
-                    f"A manifest for this analyzer and version already exists: {va}"
-                )
+                if not force:
+                    raise InvalidManifestException(
+                        f"A manifest for this analyzer and version already exists: {va}"
+                    )
 
         # and see if it can be topologically sorted
         deps_graph = new_reg._dependency_graph()
@@ -284,7 +298,7 @@ class RegistryData:
         # all is well? return the new registry
         return new_reg
 
-    def UNSAFE_add_manifest(self, manifest):
+    def UNSAFE_add_manifest(self, manifest: AnalyzerManifest) -> "RegistryData":
         name = manifest.analyzer_name
         pending_manifest = ManifestWithState(manifest)
         new_reg = self.deepcopy()
@@ -328,6 +342,21 @@ class RegistryData:
         analyzer_data.set_public()
         return new_reg
 
+    def exclude_pending(self) -> "RegistryData":
+        return RegistryData(
+            {
+                analyzer_name: AnalyzerData(
+                    {
+                        version: manifest_with_state
+                        for version, manifest_with_state in analyzer_data.versions.items()
+                        if not manifest_with_state.pending
+                    },
+                    analyzer_data.public,
+                )
+                for analyzer_name, analyzer_data in self._data.items()
+            }
+        )
+
     def get_direct_dependencies(self, va: VersionedAnalyzer) -> List[SpecifiedAnalyzer]:
         """
             Returns direct dependencies of an analyzer
@@ -350,6 +379,21 @@ class RegistryData:
                 )
 
         return resolved_values
+
+    def only_latest(self) -> "RegistryData":
+        new_registry_data = {}
+        for analyzer_name in self._data.keys():
+            if self._data[analyzer_name].versions.keys():
+                latest_version = sorted(self._data[analyzer_name].versions.keys())[-1]
+                new_registry_data[analyzer_name] = AnalyzerData(
+                    {
+                        latest_version: self._data[analyzer_name].versions[
+                            latest_version
+                        ]
+                    },
+                    self._data[analyzer_name].public,
+                )
+        return RegistryData(new_registry_data)
 
     def sorted_deps(
         self, specified_analyzer: SpecifiedAnalyzer

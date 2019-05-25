@@ -4,29 +4,43 @@ import logging
 import os
 import pathlib
 import shutil
-import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
-from typing import Callable, Dict, Iterator, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import jsondiff
 import jsonschema
+from semantic_version import Version
+
+from r2c.cli.util import find_and_open_analyzer_manifest  # type: ignore
 from r2c.lib.analyzer import Analyzer, InvalidAnalyzerIntegrationTestDefinition
-from r2c.lib.constants import S3_ANALYSIS_BUCKET_NAME, SPECIAL_ANALYZERS
-from r2c.lib.infrastructure import LocalDirInfra
-from r2c.lib.manifest import AnalyzerManifest
+from r2c.lib.constants import SPECIAL_ANALYZERS
+from r2c.lib.errors import SymlinkNeedsElevationError
+from r2c.lib.filestore import (
+    LocalFilesystemOutputStore,
+    LocalJsonOutputStore,
+    LocalLogStore,
+)
+from r2c.lib.manifest import (
+    AnalyzerDependency,
+    AnalyzerManifest,
+    AnalyzerOutputType,
+    InvalidLocalPathException,
+    LinkedAnalyzerNameMismatch,
+)
 from r2c.lib.registry import RegistryData
 from r2c.lib.specified_analyzer import AnalyzerParameters, SpecifiedAnalyzer
 from r2c.lib.util import (
-    SymlinkNeedsElevationError,
     get_tmp_dir,
+    get_unique_semver,
     sort_two_levels,
     symlink_exists,
+    url_to_repo_id,
 )
 from r2c.lib.versioned_analyzer import AnalyzerName, VersionedAnalyzer
-from semantic_version import Version
 
 TEST_VECTOR_FOLDER = "examples"  # folder with tests
 TMP_DIR = get_tmp_dir()
@@ -38,6 +52,12 @@ CONTAINER_MEMORY_LIMIT = "2G"
 UNITTEST_CMD = "/analyzer/unittest.sh"
 UNITTEST_LOCATION = "src/unittest.sh"
 
+DEFAULT_ENV_ARGS_TO_DOCKER = {
+    "GID": os.getgid(),
+    "UID": os.getuid(),
+    "UNAME": "analysis",
+}
+
 logger = logging.getLogger(__name__)
 
 
@@ -46,8 +66,6 @@ class WorkdirNotEmptyError(Exception):
         Thrown when a user-specified workdir is not an empty directory
         and the override flag is not provided
     """
-
-    pass
 
 
 def clone_repo(url, hash, target_path):
@@ -90,8 +108,13 @@ def validator_for_test(
 
 
 def integration_test(
-    manifest, analyzer_directory, workdir, env_args_dict, registry_data
-):
+    manifest: AnalyzerManifest,
+    analyzer_directory: str,
+    workdir: Optional[str],
+    env_args_dict: Dict[str, str],
+    registry_data: RegistryData,
+    use_cache: bool = False,
+) -> None:
     test_vectors_path = os.path.join(analyzer_directory, TEST_VECTOR_FOLDER)
     test_vectors: Sequence[str] = []
     if os.path.isdir(test_vectors_path):
@@ -105,7 +128,7 @@ def integration_test(
             f"⚠️ No integration test vectors in examples directory: {test_vectors_path}"
         )
 
-    results = {}
+    results: Dict[str, bool] = {}
     test_times = {}
     for test_filename in test_vectors:
         logger.info(f"Starting test: {test_filename}")
@@ -130,16 +153,18 @@ def integration_test(
                     registry_data,
                     manifest=manifest,
                     workdir=workdir,
+                    analyzer_dir=analyzer_directory,
                     code_dir=tempdir,
                     show_output_on_stdout=True,
                     pass_analyzer_output=True,
                     output_path=None,
-                    wait=False,
+                    interactive_index=None,
                     no_preserve_workdir=True,
                     env_args_dict=env_args_dict,
+                    reset_cache=not use_cache,
                     validator=validator,
                 )
-                results[test_path] = test_result
+                results[test_path] = bool(test_result)
                 test_times[test_path] = time.time() - start_time
 
     results_str = ""
@@ -148,10 +173,10 @@ def integration_test(
         time_str = time.strftime("%H:%M:%S", time.gmtime(test_times[test_path]))
         results_str += f"\n\t{status}: {test_path} (time: {time_str})"
     # print to stdout
-    print(results_str)
+    logger.info(results_str)
     num_passing = len([r for r in results.values() if r == True])
-    print("##############################################")
-    print(f"summary: {num_passing}/{len(results)} passed")
+    logger.info("##############################################")
+    logger.info(f"summary: {num_passing}/{len(results)} passed")
     if len(results) != num_passing:
         logger.error("integration test suite failed")
         sys.exit(-1)
@@ -190,6 +215,7 @@ def build_docker(
     env_args_dict: Dict = {},
     verbose: bool = False,
 ) -> int:
+    env_args_dict = {**DEFAULT_ENV_ARGS_TO_DOCKER, **env_args_dict}
     docker_image = VersionedAnalyzer(analyzer_name, version).image_id
     if not dockerfile_path:
         dockerfile_path = f"{docker_context}/Dockerfile"
@@ -208,17 +234,80 @@ def build_docker(
     return status
 
 
+def setup_locally_linked_analyzer(
+    manifest: AnalyzerManifest, registry_data: RegistryData, analyzer_directory: str
+) -> RegistryData:
+    """
+        Build and tags analyzer in ANALYZER_DIRECTORY with a unique version
+        and returns a modified registry so that local runs will resolve to said built analyzer.
+    """
+
+    new_registry = registry_data.deepcopy()
+    new_dependencies: List[AnalyzerDependency] = []
+    for dep in manifest.dependencies:
+        if not dep.path:
+            new_dependencies.append(dep)
+            continue
+        try:
+            local_manifest, local_dir = find_and_open_analyzer_manifest(
+                os.path.normpath(os.path.join(analyzer_directory, dep.path))
+            )
+        except Exception as e:
+            logger.debug(
+                f"Exception while resolving local linked dependendies: {str(e)}"
+            )
+            raise e
+        # validate name
+        if local_manifest.analyzer_name != dep.name:
+            raise LinkedAnalyzerNameMismatch(
+                f"Linked analyzer name must match {local_manifest.analyzer_name} != {dep.name}"
+            )
+
+        # build docker with unique version
+        local_version = get_unique_semver(local_manifest.version)
+        build_docker(
+            local_manifest.analyzer_name,
+            local_version,
+            os.path.relpath(local_dir, os.getcwd()),
+            verbose=True,
+        )
+
+        # add linked dep to registry
+        local_manifest.version = local_version
+        new_registry = new_registry.add_pending_manifest(local_manifest, force=True)
+
+        new_dependencies.append(
+            AnalyzerDependency(
+                AnalyzerName(local_manifest.analyzer_name),
+                wildcard_version=str(local_version),
+                parameters=dep.parameters,
+            )
+        )
+
+    # add analyzer to registry
+    manifest.dependencies = new_dependencies
+    manifest._original_json["dependencies"] = {
+        dep.name: {"version": dep.wildcard_version, "path": dep.path}
+        for dep in new_dependencies
+    }
+    new_registry = new_registry.add_pending_manifest(manifest, force=True)
+    return new_registry
+
+
 def run_analyzer_on_local_code(
     registry_data: RegistryData,
     manifest: AnalyzerManifest,
     workdir: Optional[str],
+    analyzer_dir: str,
     code_dir: str,
     output_path: Optional[str],
-    wait: bool,
     show_output_on_stdout: bool,
     pass_analyzer_output: bool,
     no_preserve_workdir: bool,
     env_args_dict: dict,
+    interactive_index: Optional[int] = None,
+    interactive_name: Optional[str] = None,
+    reset_cache: bool = False,
     validator: Callable[[str], bool] = None,
     parameters: Optional[Dict[str, str]] = None,
 ) -> Optional[bool]:
@@ -230,30 +319,53 @@ def run_analyzer_on_local_code(
         show_output_on_stdout: show the analyzer output file on stdout
         pass_analyzer_output: if false, analyzer stdout and stderr will be supressed
         validator: a callable function that takes as its argument the output.json of an analyzer and returns whether it is valid for the analyzer's schema
-        wait: don't start the container - override the start docker command so the user can take action before the container run begins
+        interactive_index: don't start the container - just shell into the container (specified by index) before anlayzer executes and exit
     """
-    infra = LocalDirInfra()
-    infra.reset()
+    json_output_store = LocalJsonOutputStore()
+    filesystem_output_store = LocalFilesystemOutputStore()
+    log_store = LocalLogStore()
+
+    if reset_cache:
+        json_output_store.delete_all()
+        filesystem_output_store.delete_all()
+        log_store.delete_all()
+
     pathlib.Path(LOCAL_RUN_TMP_FOLDER).mkdir(parents=True, exist_ok=True)
 
     versioned_analyzer = VersionedAnalyzer(manifest.analyzer_name, manifest.version)
 
-    # try adding the manifest of the current analyzer if it isn't already there
-    if versioned_analyzer not in registry_data.versioned_analyzers:
-        logger.info(
-            "Analyzer manifest not present in registry. Adding it to the local copy of registry."
-        )
-        registry_data = registry_data.add_pending_manifest(manifest)
+    if not manifest.is_locally_linked:
+        # try adding the manifest of the current analyzer if it isn't already there
+        if versioned_analyzer not in registry_data.versioned_analyzers:
+            logger.info(
+                "Analyzer manifest not present in registry. Adding it to the local copy of registry."
+            )
+            registry_data = registry_data.add_pending_manifest(manifest)
+        else:
+            logger.info("Analyzer manifest already present in registry")
     else:
-        logger.info("Analyzer manifest already present in registry")
+        registry_data = setup_locally_linked_analyzer(
+            manifest, registry_data, analyzer_dir
+        )
 
     url_placeholder, commit_placeholder = get_local_git_origin_and_commit(code_dir)
+
+    # Add any parameters required to specified_analyzer
+    if parameters is not None:
+        parameters = AnalyzerParameters(parameters)
+    specified_analyzer = SpecifiedAnalyzer(versioned_analyzer, parameters)
+
+    # Delete cached result of top level analyzer if it exists
+    json_output_store.delete(url_placeholder, commit_placeholder, specified_analyzer)
+    filesystem_output_store.delete(
+        url_placeholder, commit_placeholder, specified_analyzer
+    )
 
     # get all cloner versions from registry so we can copy the passed in code directory in place
     # of output for all versions of cloner
     versions = [
         sa.versioned_analyzer
-        for sa in registry_data.get_direct_dependencies(versioned_analyzer)
+        for sa in registry_data.sorted_deps(specified_analyzer)
         if sa.versioned_analyzer.name in SPECIAL_ANALYZERS
     ]
     logger.info(
@@ -281,11 +393,24 @@ def run_analyzer_on_local_code(
                 logger.warning("THIS IS YOUR LAST CHANCE TO BAIL OUT!")
 
         analyzer = Analyzer(
-            infra, registry_data, localrun=True, workdir=abs_workdir, timeout=0
+            registry_data,
+            json_output_store,
+            filesystem_output_store,
+            log_store,
+            localrun=True,
+            workdir=abs_workdir,
+            timeout=0,
         )
     else:
         logger.info("Using default workdir")
-        analyzer = Analyzer(infra, registry_data, localrun=True, timeout=0)
+        analyzer = Analyzer(
+            registry_data,
+            json_output_store,
+            filesystem_output_store,
+            log_store,
+            localrun=True,
+            timeout=0,
+        )
 
     for va in versions:
         with tempfile.TemporaryDirectory(prefix=LOCAL_RUN_TMP_FOLDER) as mount_folder:
@@ -327,17 +452,13 @@ def run_analyzer_on_local_code(
 
     start_ts = time.time()
 
-    # Add any parameters required to specified_analyzer
-    if parameters is not None:
-        parameters = AnalyzerParameters(parameters)
-    specified_analyzer = SpecifiedAnalyzer(versioned_analyzer, parameters)
-
     results = analyzer.full_analyze_request(
         git_url=url_placeholder,
         commit_string=commit_placeholder,
         specified_analyzer=specified_analyzer,
         force=False,
-        wait_for_start=wait,
+        interactive_index=interactive_index,
+        interactive_name=interactive_name,
         pass_analyzer_output=pass_analyzer_output,
         memory_limit=CONTAINER_MEMORY_LIMIT,
         env_args_dict=env_args_dict,
@@ -351,15 +472,26 @@ def run_analyzer_on_local_code(
         _, output_path_used = tempfile.mkstemp(dir=get_tmp_dir())
     else:
         output_path_used = output_path
-    infra.get_file(
-        S3_ANALYSIS_BUCKET_NAME, key=results["s3_key"], name=output_path_used
-    )
+
+    # Get Final Output
+    if manifest.output_type == AnalyzerOutputType.json:
+        json_output_store.get(
+            url_placeholder, commit_placeholder, specified_analyzer, output_path_used
+        )
+    elif manifest.output_type == AnalyzerOutputType.filesystem:
+        filesystem_output_store.get(
+            url_placeholder, commit_placeholder, specified_analyzer, output_path_used
+        )
 
     if show_output_on_stdout:
         logger.info(f"Analyzer output (found in: {results['container_output_path']})")
         logger.info("=" * 60)
-        with open(output_path_used, encoding="utf-8") as f:
-            print(f.read())  # explicitly send this to stdout
+        if tarfile.is_tarfile(output_path_used):
+            with tarfile.open(output_path_used, "r") as tar:
+                tar.list(verbose=False)
+        else:
+            with open(output_path_used, "r") as f:
+                print(f.read())  # explicitly send this to stdout
 
     if validator:
         return validator(output_path_used)
@@ -372,7 +504,7 @@ def run_analyzer_on_local_code(
     return None
 
 
-def get_local_git_origin_and_commit(dir):
+def get_local_git_origin_and_commit(dir: str) -> Tuple[str, str]:
     try:
         repo = (
             subprocess.check_output(
@@ -391,4 +523,7 @@ def get_local_git_origin_and_commit(dir):
         return repo, commit.replace('"', "")
     except subprocess.CalledProcessError as ex:
         logger.error(f"failed to determine source git repo or commit for {dir}")
-        return "[LOCAL_CODE]", "[LOCAL_CODE]"
+        # use same util function, but treat local relative dir path as repo
+        hash_of_dir = url_to_repo_id(dir)
+        logger.debug(f"Using {hash_of_dir}, {hash_of_dir} as repo, commit")
+        return hash_of_dir, hash_of_dir

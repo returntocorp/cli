@@ -22,10 +22,26 @@ def _to_1_2_0(spec: dict) -> None:
     pass
 
 
+def _to_2_0_0(spec: dict) -> None:
+    # 2.0.0 just adds parameter support
+    pass
+
+
+def _to_2_1_0(spec: dict) -> None:
+    # this is left intentionally blank because the 2.1.0 of manifest is backwards
+    # compatible with 2.0.0 in that `path` is optional field
+    pass
+
+
 # A list of (version, function) pairs. Each function should take a schema of
 # the previous version as input and migrate it to be compliant with the given
 # version.
-_MIGRATORS = [(Version("1.1.0"), _to_1_1_0), (Version("1.2.0"), _to_1_2_0)]
+_MIGRATORS = [
+    (Version("1.1.0"), _to_1_1_0),
+    (Version("1.2.0"), _to_1_2_0),
+    (Version("2.0.0"), _to_2_0_0),
+    (Version("2.1.0"), _to_2_1_0),
+]
 
 
 def migrate(spec: dict) -> dict:
