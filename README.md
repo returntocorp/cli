@@ -7,7 +7,7 @@ This is the CLI for interacting with the R2C platform.
 ### Prerequisites
 
 - [Install Docker](https://docs.docker.com/install/) for your platform
-- [Python 3.7 and up](https://www.python.org/about/gettingstarted/) for your platform
+- [Python 3.6 and up](https://www.python.org/about/gettingstarted/) for your platform
 
 ### Setup
 
