@@ -4,9 +4,7 @@ import webbrowser
 from typing import Any, Dict, Optional
 
 import click
-import docker
 import requests
-from docker.errors import APIError
 from requests.models import HTTPError, Response
 
 from r2c.cli.errors import get_cli_error_for_api_error
@@ -20,6 +18,7 @@ from r2c.cli.logger import (
     print_warning,
 )
 from r2c.cli.util import (
+    check_docker_is_running,
     get_default_org,
     get_default_token,
     get_version,
@@ -40,7 +39,7 @@ def handle_request_with_error_message(r: Response) -> dict:
     """
     try:
         r.raise_for_status()
-    except HTTPError as e:
+    except HTTPError:
         json_response = r.json()
         api_error_code = json_response["error_type"]
         api_error_msg = f"{json_response['message']}. {json_response['next_steps']}"
@@ -71,7 +70,7 @@ def get_registry_data() -> RegistryData:
 
 
 def fetch_registry_data():
-    org = get_default_org()
+    get_default_org()
     url = f"{get_base_url()}/api/v1/analyzers/"
     r = auth_get(url)
 
@@ -87,25 +86,9 @@ def open_browser_login(org: Optional[str]) -> None:
     print_msg(f"trying to open {url} in your browser...")
     try:
         webbrowser.open(url, new=0, autoraise=True)
-    except Exception as e:
+    except Exception:
         print_msg(
             f"Unable to open a web browser. Please visit {url} and paste the token in here"
-        )
-
-
-def check_docker_is_running():
-    try:
-        client = docker.from_env()
-        client.info()
-    except APIError as e:
-        # when docker server fails
-        print_error_exit(
-            "`docker info` failed. Please confirm docker daemon is running in user mode."
-        )
-    except Exception as e:
-        # Other stuff this might throw like, permission error
-        print_error_exit(
-            "`docker info` failed. Please confirm docker is installed and its daemon is running in user mode."
         )
 
 
@@ -137,10 +120,7 @@ def do_login(
     if org is None:
         org = get_default_org()
         if org is None:
-            org = click.prompt(
-                "Please enter your org name, or to use the common r2c platform, press enter",
-                default=PLATFORM_ANALYZER_PREFIX,
-            )
+            org = PLATFORM_ANALYZER_PREFIX
     if not login_token:
         if click.confirm(
             "Opening web browser to get login token. Do you want to continue?",
@@ -154,7 +134,7 @@ def do_login(
         for attempt in range(MAX_RETRIES):
             # validate token
             token = check_valid_token_with_logging(
-                org, click.prompt("Please enter the API token")
+                org, click.prompt("Please enter the API token", hide_input=True)
             )
             if token:
                 return token
@@ -289,7 +269,7 @@ def validate_token(org: str, token: str) -> bool:
             f"{get_base_url(org)}/api/users", headers=headers, timeout=DEFAULT_TIMEOUT
         )
         return r.status_code == requests.codes.ok
-    except Exception as e:
+    except Exception:
         # TODO log exception
         return False
 

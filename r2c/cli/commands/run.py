@@ -8,6 +8,7 @@ from r2c.cli.logger import (
     abort_on_build_failure,
     get_logger,
     print_error_exit,
+    print_exception_exit,
     print_msg,
     print_success,
     print_warning,
@@ -25,11 +26,13 @@ from r2c.cli.util import (
     set_debug_flag,
     set_verbose_flag,
 )
-from r2c.lib.errors import SymlinkNeedsElevationError
+from r2c.lib.analyzer import AnalyzerNonZeroExitError
+from r2c.lib.errors import AnalyzerOutputNotFound, SymlinkNeedsElevationError
 from r2c.lib.run import build_docker, run_analyzer_on_local_code
 from r2c.lib.versioned_analyzer import AnalyzerName
 
 logger = get_logger()
+
 
 # Hack click to accepting optional options
 # https://stackoverflow.com/questions/40753999/python-click-make-option-value-optional
@@ -161,11 +164,10 @@ def run(
     published analyzers.
     """
 
-    if verbose == True:  # allow passing --verbose to run as well as globally
+    if verbose is True:  # allow passing --verbose to run as well as globally
         set_verbose_flag(ctx, True)
-    if debug == True:
+    if debug is True:
         set_debug_flag(ctx, True)
-    docker_verbose_mode = ctx.obj["VERBOSE"] or ctx.obj["DEBUG"]
     print_msg(f"🏃 Starting to run analyzer...")
 
     interactive_index = -1 if interactive else None
@@ -233,7 +235,7 @@ def run(
             manifest.version,
             os.path.relpath(analyzer_directory, os.getcwd()),
             env_args_dict=env_args_dict,
-            verbose=docker_verbose_mode,
+            no_cache=reset_cache,
         )
     )
     try:
@@ -249,26 +251,31 @@ def run(
             print_msg(f"🔎 Running analysis on `{analyzer_input}`")
 
         logger.info(f"Reset cache: {reset_cache}")
-        run_analyzer_on_local_code(
-            registry_data=registry_data,
-            manifest=manifest,
-            workdir=None,
-            analyzer_dir=analyzer_directory,
-            code_dir=analyzer_input,
-            output_path=output_path,
-            show_output_on_stdout=not quiet,
-            pass_analyzer_output=not analyzer_quiet,
-            no_preserve_workdir=True,
-            parameters=parameter_obj,
-            env_args_dict=env_args_dict,
-            interactive_index=interactive_index,
-            interactive_name=interactive_name,
-            reset_cache=reset_cache,
-        )
+        try:
+            run_analyzer_on_local_code(
+                registry_data=registry_data,
+                manifest=manifest,
+                workdir=None,
+                analyzer_dir=analyzer_directory,
+                code_dir=analyzer_input,
+                output_path=output_path,
+                show_output_on_stdout=not quiet,
+                pass_analyzer_output=not analyzer_quiet,
+                no_preserve_workdir=True,
+                parameters=parameter_obj,
+                env_args_dict=env_args_dict,
+                interactive_index=interactive_index,
+                interactive_name=interactive_name,
+                reset_cache=reset_cache,
+            )
+        except AnalyzerOutputNotFound as fne:
+            print_error_exit(str(fne), err=False)
+        except AnalyzerNonZeroExitError as ae:
+            print_exception_exit("Analyzer non-zero exit", ae, err=False)
         if output_path:
             path_msg = f"Analysis results in `{output_path}`."
         else:
-            path_msg = f"Analysis results printed to `stdout`."
+            path_msg = f"Analysis results printed to `stdout`. unless suppressed explicitly with `-q`"
         print_success(f"Finished analyzing `{analyzer_input}`. {path_msg}")
 
     except SymlinkNeedsElevationError as sym:

@@ -9,13 +9,16 @@ import click
 from r2c.cli import R2C_SUPPORT_EMAIL
 from r2c.lib.constants import PLATFORM_ANALYZER_PREFIX
 
-DOCKER_FILE = """FROM ubuntu:17.10
+DOCKER_FILE = """FROM ubuntu:18.10
+# TODO: Analyzer specific packages below
 
+# Setup analysis user for docker
 RUN groupadd -r analysis && useradd -m --no-log-init --gid analysis analysis
-
 USER analysis
 COPY src /analyzer
 
+
+# Setup entrypoint into the analysis code logic
 WORKDIR /
 CMD ["/analyzer/analyze.sh"]"""
 
@@ -80,7 +83,7 @@ def create_template_analyzer(
         readme = README.format(analyzer_name, author_name)
         create_file(os.path.join(analyzer_name, "README.md"), readme)
 
-    except FileExistsError as e:
+    except FileExistsError:
         click.echo(
             f"❌ {analyzer_name} already exists. Please delete and run again", err=True
         )

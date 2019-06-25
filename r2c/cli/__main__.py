@@ -6,6 +6,7 @@ from r2c.cli.commands.login import login, logout
 from r2c.cli.commands.push import push
 from r2c.cli.commands.run import run
 from r2c.cli.commands.test import test
+from r2c.cli.commands.upload_inputset import upload_inputset
 from r2c.cli.errors import CliError
 from r2c.cli.logger import print_exception_exit
 

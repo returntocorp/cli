@@ -24,7 +24,6 @@ def build(ctx, analyzer_directory, env_args_string):
     manifest, analyzer_directory = find_and_open_analyzer_manifest(
         analyzer_directory, ctx
     )
-    verbose_mode = ctx.obj["VERBOSE"]
 
     print_msg("🔨 Building docker container")
 
@@ -34,6 +33,5 @@ def build(ctx, analyzer_directory, env_args_string):
             manifest.version,
             os.path.relpath(analyzer_directory, os.getcwd()),
             env_args_dict=parse_remaining(env_args_string),
-            verbose=verbose_mode,
         )
     )

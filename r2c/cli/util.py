@@ -4,6 +4,9 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional, Tuple
 
+import docker
+from docker.errors import APIError
+
 from r2c.cli.errors import ManifestNotFoundError, ReadmeNotFoundError
 from r2c.cli.logger import (
     get_logger,
@@ -41,6 +44,25 @@ def get_version():
     from r2c.cli import __version__
 
     return __version__
+
+
+def check_docker_is_running() -> Optional[Dict[str, Any]]:
+    """Calls `docker info` and throws if it fails. If not, return info as dict"""
+    try:
+        client = docker.from_env()
+        return client.info()
+    except APIError:
+        # when docker server fails
+        print_error_exit(
+            "`docker info` failed. Please confirm docker daemon is running in user mode."
+        )
+        return None
+    except Exception:
+        # Other stuff this might throw like, permission error
+        print_error_exit(
+            "`docker info` failed. Please confirm docker is installed and its daemon is running in user mode."
+        )
+        return None
 
 
 def parse_remaining(pairs: str) -> Dict:
@@ -257,7 +279,7 @@ def find_and_open_analyzer_readme(path: str, ctx: Any = None) -> Optional[str]:
             if ctx
             else DEFAULT_MANIFEST_TRAVERSAL_LIMIT,
         )
-    except ReadmeNotFoundError as e:
+    except ReadmeNotFoundError:
         logger.debug("Readme not found")
         return None
 

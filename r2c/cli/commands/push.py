@@ -35,26 +35,27 @@ from r2c.lib.run import build_docker
 from r2c.lib.versioned_analyzer import VersionedAnalyzer
 
 
-def _docker_push(image_id: str, verbose: bool) -> bool:
+def _docker_push(image_id: str) -> bool:
     """Pushes docker image to ECR using docker credentials"""
     docker_push_cmd = f"docker push {image_id}"
-    if verbose:
-        docker_push_cmd += " 1>&2"
-    else:
-        docker_push_cmd += " >/dev/null"
+    docker_push_cmd += " 1>&2"
     get_logger().debug(f"Running push with command: {docker_push_cmd}")
     return_code = subprocess.call(docker_push_cmd, shell=True)
     return return_code == 0
 
 
 def _upload_analyzer_manifest(
-    manifest: AnalyzerManifest, readme: Optional[str] = None
+    manifest: AnalyzerManifest, force: bool, readme: Optional[str] = None
 ) -> str:
     get_logger().info(f"Uploading manifest")
     analyzer_json = manifest.to_json()
     if "readme" not in analyzer_json and readme:
         analyzer_json["readme"] = readme
-    r = auth_post(f"{get_base_url()}/api/v1/analyzers/", json=analyzer_json)
+    # this unwrapping thing is ugly, but we have to do it for backwards compatibility
+    # since we can't add a manifest field
+    r = auth_post(
+        f"{get_base_url()}/api/v1/analyzers/", json={**analyzer_json, "force": force}
+    )
     data = handle_request_with_error_message(r)
     link = data.get("links", {}).get("artifact_url")
     return link
@@ -67,9 +68,22 @@ def _upload_analyzer_manifest(
     default=os.getcwd(),
     help="The directory where the analyzer is located, defaulting to the current directory.",
 )
+@click.option(
+    "--force",
+    is_flag=True,
+    default=True,
+    help="Overwrite analyzer of the same name and version if it exists in the registry as pending (its corresponding image hasn't been uploaded). "
+    "This is usually useful for cases when an image upload was aborted or failed.",
+)
+@click.option(
+    "--squash",
+    is_flag=True,
+    default=False,
+    help="Squash newly built docker layers into a single new layer before pushing to `r2c`",
+)
 @click.argument("env_args_string", nargs=-1, type=click.Path())
 @click.pass_context
-def push(ctx, analyzer_directory, env_args_string):
+def push(ctx, analyzer_directory, force, squash, env_args_string):
     """
     Push the analyzer in the current directory to the R2C platform.
 
@@ -80,7 +94,6 @@ def push(ctx, analyzer_directory, env_args_string):
 
     Your analyzer name must follow {org}/{name}.
     """
-    verbose = ctx.obj["VERBOSE"]
     env_args_dict = parse_remaining(env_args_string)
 
     manifest, analyzer_directory = find_and_open_analyzer_manifest(
@@ -89,9 +102,14 @@ def push(ctx, analyzer_directory, env_args_string):
     readme = find_and_open_analyzer_readme(analyzer_directory, ctx)
     analyzer_org = get_org_from_analyzer_name(manifest.analyzer_name)
 
+    overwriting_message = (
+        " and forcing overwrite if the analyzer version exists and is pending upload."
+    )
     # TODO(ulzii): let's decide which source of truth we're using for analyzer_name above and/or check consistency.
     # can't have both dir name and what's in analyzer.json
-    print_msg(f"📌 Pushing analyzer in {analyzer_directory}...")
+    print_msg(
+        f"📌 Pushing analyzer in {analyzer_directory}{overwriting_message if force else ''}..."
+    )
 
     default_org = get_default_org()
     if default_org is None:
@@ -108,7 +126,7 @@ def push(ctx, analyzer_directory, env_args_string):
             )
     try:
         # upload analyzer.json
-        artifact_link = _upload_analyzer_manifest(manifest, readme)
+        artifact_link = _upload_analyzer_manifest(manifest, force, readme)
     except Exception as e:
         print_exception_exit("There was an error uploading your analyzer", e)
     if artifact_link is None:
@@ -142,13 +160,13 @@ def push(ctx, analyzer_directory, env_args_string):
             manifest.version,
             os.path.relpath(analyzer_directory, os.getcwd()),
             env_args_dict=env_args_dict,
-            verbose=verbose,
+            squash=squash,
         )
     )
     # docker push
     image_id = VersionedAnalyzer(manifest.analyzer_name, manifest.version).image_id
     print_msg(f"Pushing docker container to `{analyzer_org}`")
-    successful_push = _docker_push(image_id, verbose)
+    successful_push = _docker_push(image_id)
     if not successful_push:
         print_error_exit(
             "There was an error pushing the Docker image. Please ask for help from R2C support"
@@ -168,8 +186,6 @@ def push(ctx, analyzer_directory, env_args_string):
                 f"Upload finished successfully for analyzer! Visit: {web_url}"
             )
         else:
-            print_error_exit(
-                "Error confirming analyzer was successfully uploaded. Please contact us with the following information: failed to confirm analyzer finished uploading."
-            )
+            print_error_exit("Error confirming analyzer was successfully uploaded.")
     except Exception as e:
         print_exception_exit("Error confirming analyzer was successfully uploaded", e)

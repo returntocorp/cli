@@ -1,11 +1,12 @@
+import sys
 from typing import Optional, Tuple
 
 import click
 from semantic_version import Version
 
-from r2c.cli.logger import get_logger, print_error_exit, print_msg
+from r2c.cli.logger import get_logger, print_error, print_error_exit, print_msg
 from r2c.cli.network import auth_get, get_base_url, handle_request_with_error_message
-from r2c.cli.util import get_default_org, get_version, set_debug_flag, set_verbose_flag
+from r2c.cli.util import get_version, set_debug_flag, set_verbose_flag
 
 logger = get_logger()
 
@@ -32,13 +33,11 @@ def _print_version(ctx, param, value):
 
 def fetch_latest_version() -> Tuple[Optional[str], Optional[bool]]:
     try:
-        org = get_default_org()
-
         url = f"{get_base_url()}/api/cli/version/latest"
         r = auth_get(url, timeout=2.0)  # sec
         response_json = handle_request_with_error_message(r)
         return response_json.get("latest"), response_json.get("forceUpgrade")
-    except Exception as e:
+    except Exception:
         return None, None
 
 
@@ -66,6 +65,12 @@ def is_running_latest() -> bool:
         # fail safe
         logger.info(f"Unexpected error comparing latest and current version: {e}")
         return True
+
+
+def is_running_supported_python3() -> bool:
+    python_major_v = sys.version_info.major
+    python_minor_v = sys.version_info.minor
+    return python_major_v >= 3 and python_minor_v >= 6
 
 
 @click.group()
@@ -103,6 +108,8 @@ def cli(ctx, debug, verbose, no_traverse_manifest):
     ctx.ensure_object(dict)
     if not is_running_latest():
         print_msg(UPGRADE_WARNING_OUTPUT)
+    if not is_running_supported_python3():
+        print_error("Please upgrade to python3.6 to run r2c-cli.")
     set_debug_flag(ctx, debug)
     set_verbose_flag(ctx, verbose)
     ctx.obj["NO_TRAVERSE_MANIFEST"] = no_traverse_manifest

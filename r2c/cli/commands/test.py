@@ -3,9 +3,19 @@ import os
 import click
 
 from r2c.cli.commands.cli import cli
-from r2c.cli.logger import abort_on_build_failure, print_error, print_msg, print_success
+from r2c.cli.logger import (
+    abort_on_build_failure,
+    print_error,
+    print_error_exit,
+    print_msg,
+    print_success,
+)
 from r2c.cli.network import get_registry_data
-from r2c.cli.util import find_and_open_analyzer_manifest, parse_remaining
+from r2c.cli.util import (
+    check_docker_is_running,
+    find_and_open_analyzer_manifest,
+    parse_remaining,
+)
 from r2c.lib.errors import SymlinkNeedsElevationError
 from r2c.lib.run import build_docker, integration_test, run_docker_unittest
 from r2c.lib.versioned_analyzer import VersionedAnalyzer
@@ -51,6 +61,7 @@ def test(ctx, analyzer_directory, which, cache, env_args_string):
     manifest, analyzer_directory = find_and_open_analyzer_manifest(
         analyzer_directory, ctx
     )
+    check_docker_is_running()
     print_msg("🔨 Building docker container")
     abort_on_build_failure(
         build_docker(
@@ -58,7 +69,6 @@ def test(ctx, analyzer_directory, which, cache, env_args_string):
             manifest.version,
             os.path.relpath(analyzer_directory, os.getcwd()),
             env_args_dict=env_args_dict,
-            verbose=verbose,
         )
     )
     if which == "unit" or which == "all":
@@ -76,15 +86,20 @@ def test(ctx, analyzer_directory, which, cache, env_args_string):
             print_error(f"Unit tests failed with status {status}")
     if which == "integration" or which == "all":
         try:
-            integration_test(
+            passed_all = integration_test(
                 manifest=manifest,
                 analyzer_directory=analyzer_directory,
                 workdir=None,
+                verbose=verbose,
                 env_args_dict=env_args_dict,
                 registry_data=get_registry_data(),
                 use_cache=cache,
             )
-            print_success(f"Integration tests passed")
+            if passed_all:
+                print_success(f"All integration tests passed")
+            else:
+                print_error_exit(f"Some integration tests failed", status_code=-1)
+
         except SymlinkNeedsElevationError as sym:
             print_error(
                 f"Error setting up integration tests. {sym}. Try again as an admin"

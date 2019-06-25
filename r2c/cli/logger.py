@@ -96,13 +96,14 @@ def print_error_exit(
     message: str, status_code: int = 1, err: bool = True, already_logged: bool = False
 ) -> None:
     print_error(message, err=err, already_logged=already_logged)
-    print_prompt_for_gh_issue()
+    if err:
+        print_prompt_for_gh_issue()
     sys.exit(status_code)
 
 
 def print_exception_exit(message: str, e: Exception, err: bool = True) -> None:
     logger.exception(message)
-    print_error_exit(f"{message}: {str(e)}", already_logged=True)
+    print_error_exit(f"{message}: {str(e)}", err=err, already_logged=True)
 
 
 def print_prompt_for_gh_issue() -> None:

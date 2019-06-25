@@ -64,6 +64,31 @@ r2c push
 
 to upload your analyzer to your repository.
 
+## Uploading new input set
+
+Use `r2c upload-inputset` command. Make sure your input set follow the following format!
+
+```json
+{
+  "name": "",
+  "version": "",
+  "author": "",
+  "description": "This is a description",
+  "inputs": [
+    {
+      "input_type": "GitRepoCommit",
+      "repo_url": "https://....",
+      "commit_hash": "1234321324...124"
+    },
+    {
+      "input_type": "GitRepoCommit",
+      "repo_url": "https://....",
+      "commit_hash": "1234321324...124"
+    }
+  ]
+}
+```
+
 ## Troubleshooting
 
 - If you run into issues running `r2c` commands, you can run with `--verbose` flag and reach out to `support@ret2.co` with the error log.
