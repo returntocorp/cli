@@ -103,8 +103,7 @@ class InteractiveCommand(click.Command):
     default=False,
 )
 @click.option(
-    "--debug",
-    "-d",
+    "--debug", 
     is_flag=True,
     help="Show extra output, error messages, and exception stack traces with DEBUG filtering",
     default=False,
