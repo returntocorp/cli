@@ -266,7 +266,7 @@ def validate_token(org: str, token: str) -> bool:
     try:
         headers = {**get_default_headers(), **get_auth_header(token)}
         r = requests.get(
-            f"{get_base_url(org)}/api/users", headers=headers, timeout=DEFAULT_TIMEOUT
+            f"{get_base_url(org)}/api/check-token", headers=headers, timeout=DEFAULT_TIMEOUT
         )
         return r.status_code == requests.codes.ok
     except Exception:
