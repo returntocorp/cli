@@ -9,7 +9,7 @@ more-itertools==7.0.0
 mypy-extensions==0.4.1
 mypy==0.701
 pluggy==0.11.0
-py==1.8.0
+py==1.10.0
 pytest==3.10.1
 six==1.12.0
 toml==0.10.0
